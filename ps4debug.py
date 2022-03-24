@@ -89,14 +89,15 @@ class PS4Debugger(object):
    def __init__(self, host, port=744):
       super(PS4Debugger, self).__init__()
       self.endpoint = (host, port)
-
       self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      self.sock.connect(self.endpoint)
-
       # TODO Define structs to avoid creating them each (un)pack()-call
       pass
 
-   def __del__(self):
+   def __enter__(self):
+      self.sock.connect(self.endpoint)
+      return self
+
+   def __exit__(self, type, value, traceback):
       self.sock.shutdown(socket.SHUT_RDWR)
       self.sock.close()
       del self.sock
