@@ -12,7 +12,7 @@ def main():
 
    # Define partials to freeze certain parameters
    get_score = partial(debugger.read_int32, pid=eboot_pid, address=0xCAB47F8)
-   set_score = partial(debugger.write_int, eboot_pid, 0xCAB47F8)
+   set_score = partial(debugger.write_int32, eboot_pid, 0xCAB47F8)
 
    score = get_score()
    set_score(score + 99999)
