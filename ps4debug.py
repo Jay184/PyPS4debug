@@ -200,19 +200,22 @@ class PS4Debugger(object):
       self.send_command(CMD_PROC_INSTALL, pid_bytes)
       data = self.sock.recv(8)
       return int.from_bytes(data, 'little')
-   def call(self, pid, rpc_stub, address, parameter_format = '', *args):
+   def call(self, pid, rpc_stub, address, *args, **kwargs):
       CMD_PROC_CALL_PACKET_SIZE = 68
       PROC_CALL_SIZE = 12
-      payload = struct.pack('<i2Q', pid, rpc_stub, address)
 
-      assert struct.calcsize(parameter_format) <= CMD_PROC_CALL_PACKET_SIZE - len(payload)
-      parameters = struct.pack(parameter_format, *args)
-      payload += parameters
+      header_size = struct.calcsize('<i2Q')
+      payload = bytearray(CMD_PROC_CALL_PACKET_SIZE - header_size)
+
+      assert struct.calcsize(parameter_format) <= len(payload)
+
+      struct.pack_into('<i2Q', payload, 0, pid, rpc_stub, address)
+      struct.pack_into(parameter_format, payload, header_size, *args)
       self.send_command(CMD_PROC_CALL, payload)
 
       rax = self.sock.recv(PROC_CALL_SIZE)
       res, rax = struct.unpack('<iQ', rax)
-      assert res == 70
+      assert res == 70 # TODO Unknown?
       return rax
    def load_elf(self, pid, elf_path):
       # TODO https://github.com/jogolden/ps4debug/blob/b446dced06009705c6f8d70e79113637d1690210/libdebug/cpp/source/PS4DBG.cpp#L380
