@@ -1,1 +1,1 @@
-from .core import PS4Debugger
+from .core import PS4Debug
