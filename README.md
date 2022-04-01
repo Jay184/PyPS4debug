@@ -1,6 +1,13 @@
 # PyPS4debug
 ps4debug implementation in python.
 
+## Install (pip)
+
+```
+pip install ps4debug
+```
+
+
 Example usage
 ```python
 import sys

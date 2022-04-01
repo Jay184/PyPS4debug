@@ -5,7 +5,7 @@ setup(
     name='ps4debug',
     version='0.0.1',
     author='Jay',
-    author_email='Jay#4711',
+    author_email='0jaybae0@gmail.com',
     description='Integrates into Future Tone on the PS4',
     url='https://github.com/Jay184/PyPS4debug',
     project_urls={
