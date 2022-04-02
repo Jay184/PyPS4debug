@@ -55,8 +55,13 @@ async def main(ip_address):
             gold = await get_gold()
             await set_gold(gold + 10)
             await injected_function(1, 2, 3, 4, 5, 6)
+            
+        # Attaching the debugger works similarly
+        async with ps4.debugger(pid, resume=True) as debugger:
+            # Inside this context, a server on port 755 is being run to listen for debugger events.
+            pass
 
-  
+
 if __name__ == '__main__':
     # Normally you would use something like Typer for this
     args = sys.argv[1:]
