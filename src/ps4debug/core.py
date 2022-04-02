@@ -94,3 +94,10 @@ class ProcessInfo(NamedTuple):
     path: str
     title_id: str
     content_id: str
+
+
+class ThreadInfo(NamedTuple):
+    """Contains thread information."""
+    pid: int
+    priority: int
+    name: str

@@ -74,29 +74,89 @@ class AllocatedMemoryContext(object):
 
 
 class DebuggingContext(object):
+    max_breakpoints = 10
+    max_watchpoints = 4
+
     def __init__(self, ps4debug, pid: int, port: int = 755, resume: bool = False):
         super(DebuggingContext, self).__init__()
         self.ps4debug: PS4Debug = ps4debug
         self.port = port
         self.pid = pid
+        self.server = None
+        self.attached = False
         self.__resume = resume
 
     async def __aenter__(self):
-        self.server = await asyncio.start_server(self.__connected, '0.0.0.0', 755)
-        await self.ps4debug.attach_debugger(self.pid, self.__resume)
+        await self.attach(self.pid, self.port, self.__resume)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.ps4debug.detach_debugger()
+        await self.detach()
+
+    async def attach(self, pid: int, port: int = 755, resume: bool = False) -> ResponseCode:
+        """
+        Attaches the debugger to the process on the remote system and
+        causes it to connect to the debugger port of this machine.
+        Note that this will pause the processes on the system.
+        @param port: Port to listen for debug events on.
+        @param pid: Process id.
+        @param resume: If true, will automatically resume the processes.
+        @return: Response code.
+        """
+        self.server = await asyncio.start_server(self.__connected, '0.0.0.0', port)
+
+        pid_bytes = pid.to_bytes(4, 'little')
+        status = await self.ps4debug.send_command(commands.DEBUG_ATTACH, pid_bytes)
+        self.attached = status == ResponseCode.SUCCESS
+
+        if not resume or status != ResponseCode.SUCCESS:
+            return status
+
+        return await self.resume_process()
+
+    async def detach(self) -> ResponseCode:
+        """
+        Detaches the debugger from the remote system.
+        @return: Response code.
+        """
+        self.attached = False
+        status = await self.ps4debug.send_command(commands.DEBUG_DETACH)
+
         async with self.server:
             self.server.close()
             await self.server.wait_closed()
 
-    async def resume(self):
-        await self.ps4debug.resume_process()
+        return status
 
-    async def stop(self):
-        await self.ps4debug.stop_process()
+    async def resume_process(self) -> ResponseCode:
+        """
+        Resumes all processes on the remote system.
+        @return: Response code
+        """
+        return await self.ps4debug.send_command(commands.DEBUG_STOPGO, b'\x00\x00\x00\x00')
+
+    async def stop_process(self) -> ResponseCode:
+        """
+        Stops all processes on the remote system.
+        @return: Response code
+        """
+        return await self.ps4debug.send_command(commands.DEBUG_STOPGO, b'\x01\x00\x00\x00')
+
+    async def get_threads(self) -> list[int]:
+        """
+        Retrieves a list of threads in the debugging process
+        @return: List of thread ids.
+        """
+        status = await self.ps4debug.send_command(commands.DEBUG_THREADS)
+
+        if status != ResponseCode.SUCCESS:
+            return []
+
+        count = await self.ps4debug.reader.read(4)
+        count = int.from_bytes(count, 'little')
+
+        data = await self.ps4debug.reader.read(count * 4)
+        return [int.from_bytes(data[i:i+4], 'little') for i in range(0, count * 4, 4)]
 
     async def __connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info('peername')
@@ -111,8 +171,6 @@ class DebuggingContext(object):
 class PS4Debug(object):
     """Offers standard ps4debug methods."""
     magic = 0xFFAABBCC
-    max_breakpoints = 10
-    max_watchpoints = 4
 
     def __init__(self, host: str = None, port: int = 744):
         """
@@ -149,17 +207,17 @@ class PS4Debug(object):
     async def __aexit__(self, type_, value, traceback):
         await self.disconnect()
 
-    async def __recv_int32(self):
+    async def __recv_int32(self) -> int:
         data = await self.__recv_all(4)
         data = int.from_bytes(data, 'little')
         return data
 
-    async def __recv_int64(self):
+    async def __recv_int64(self) -> int:
         data = await self.__recv_all(8)
         data = int.from_bytes(data, 'little')
         return data
 
-    async def __recv_all(self, length):
+    async def __recv_all(self, length) -> bytearray:
         received = 0
         data = bytearray()
 
@@ -175,7 +233,7 @@ class PS4Debug(object):
 
         return data
 
-    def __create_header(self, code, payload_length):
+    def __create_header(self, code, payload_length) -> bytes:
         """
         Creates the PS4Debug header (magic, command, payload length)
         @param code: PS4 debug command constant
@@ -249,7 +307,7 @@ class PS4Debug(object):
         status_bytes = await self.__recv_all(4)
         return ResponseCode.from_bytes(status_bytes)
 
-    async def send_command(self, code, payload=None, status=True) -> ResponseCode | None:
+    async def send_command(self, code: int, payload=None, status=True) -> ResponseCode | None:
         payload_length = len(payload) if payload else 0
         header = self.__create_header(code, payload_length)
 
@@ -510,7 +568,7 @@ class PS4Debug(object):
         missing_bytes = 8 - struct.calcsize(output_format)
         result = await self.__recv_all(result_size)
 
-        pid = int.from_bytes(result[:4], 'little')
+        _ = int.from_bytes(result[:4], 'little')  # pid
         rax = struct.unpack(output_format + 'x' * missing_bytes, result[4:])
         return rax
 
@@ -669,6 +727,7 @@ class PS4Debug(object):
     write_float = functools.partialmethod(__write_type, structure='<f')
     write_double = functools.partialmethod(__write_type, structure='<d')
 
+    # Unfinished
     def scan_int32(self, pid: int, compare_type: core.ScanCompareType, *values) -> list[int]:
         bytes_value1 = struct.pack('<i', values[0]) if len(values) > 0 else b''
         bytes_value2 = struct.pack('<i', values[1]) if len(values) > 1 else b''
@@ -710,66 +769,26 @@ class PS4Debug(object):
         """
         pass
 
-    # Unfinished
-
-    async def attach_debugger(self, pid: int, resume: bool = False) -> ResponseCode:
-        """
-        Attaches the debugger to the process on the remote system and
-        causes it to connect to the debugger port of this machine.
-        Note that this will pause the processes on the system.
-        @param pid: Process id.
-        @param resume: If true, will automatically resume the processes.
-        @return: Response code
-        """
-        # if self.is_debugged:
-        #     return ResponseCode.ALREADY_DEBUG
-        # self.is_debugged = True
-
-        pid_bytes = pid.to_bytes(4, 'little')
-        status = await self.send_command(commands.DEBUG_ATTACH, pid_bytes)
-
-        if not resume or status != ResponseCode.SUCCESS:
-            return status
-
-        return await self.resume_process()
-
-    async def detach_debugger(self) -> ResponseCode:
-        """
-        Detaches the debugger from the remote system.
-        @return: Response code.
-        """
-        # if not self.is_debugged:
-        #     return ResponseCode.DATA_NULL
-        # self.is_debugged = False
-        return await self.send_command(commands.DEBUG_DETACH)
-
-    async def resume_process(self) -> ResponseCode:
-        """
-        Resumes all processes on the remote system.
-        @return: Response code
-        """
-        return await self.send_command(commands.DEBUG_STOPGO, b'\x00\x00\x00\x00')
-
-    async def stop_process(self) -> ResponseCode:
-        """
-        Stops all processes on the remote system.
-        @return: Response code
-        """
-        return await self.send_command(commands.DEBUG_STOPGO, b'\x01\x00\x00\x00')
-
-    def get_threads(self) -> list[int]:
+    async def get_thread_info(self, thread_id: int) -> object:
         """
 
+        @param thread_id:
         @return:
         """
+        entry_size = 40
+        id_bytes = int.to_bytes(4, thread_id, 'little')
 
-    def get_thread_info(self, lwpid: int) -> object:
-        """
+        await self.send_command(commands.DEBUG_THRINFO, id_bytes)
+        data = await self.__recv_all(entry_size)
+        # pid, priority, name = ... struct in __init__
+        # use name[:name.index(0)].decode('ascii')
 
-        @param lwpid:
-        @return:
-        """
-        raise NotImplementedError()
+        pid = int.from_bytes(data[:4], 'little')
+        priority = int.from_bytes(data[4:8], 'little')
+        print(data)
+        #name = data[8:8+data.index(0, 8)].decode('ascii')
+
+        return core.ThreadInfo(pid=pid, priority=priority, name='')
 
     def breakpoint(self, index: int, enabled: bool, address: int) -> ResponseCode:
         """
