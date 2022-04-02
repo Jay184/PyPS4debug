@@ -126,8 +126,8 @@ class PS4Debug(object):
 
         self.endpoint = (host, port)
         self.connected = False
-        self.reader: asyncio.StreamReader
-        self.writer: asyncio.StreamWriter
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
 
         # Structs
         self.__header_struct = struct.Struct('<3I')
@@ -215,17 +215,16 @@ class PS4Debug(object):
 
         return ps4_ip if result == magic else None
 
-    @classmethod
-    def send_ps4debug(cls, host: str, port: int = 9020, file_path: str = 'ps4debug.bin'):
-        # TODO make async
+    @staticmethod
+    async def send_ps4debug(host: str, port: int = 9020, file_path: str = 'ps4debug.bin'):
         with open(file_path, 'rb') as f:
             content = f.read()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(30.0)
-            sock.connect((host, port))
-            sock.sendall(content)
-            sock.shutdown(socket.SHUT_RDWR)
-            sock.close()
+
+        reader, writer = await asyncio.open_connection(host, port)
+        writer.write(content)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
 
     def memory(self, pid, length) -> AllocatedMemoryContext:
         """
