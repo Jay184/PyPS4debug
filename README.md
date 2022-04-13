@@ -1,5 +1,5 @@
 # PyPS4debug
-ps4debug implementation in python.
+Fully asynchronous ps4debug implementation written in python.
 
 ## Install (pip)
 
@@ -33,7 +33,27 @@ async def main(ip_address):
         status = await ps4.write_int32(pid, 0xCA44444, 9999)
         if status != ps4debug.ResponseCode.SUCCESS:
             print('There was an error!')
-      
+            
+        # Let's do something where the async features shines
+        tasks = [
+            asyncio.create_task( ps4.write_int32(pid, 0x123456, 1000) ),
+            asyncio.create_task( ps4.write_int32(pid, 0x789ABC, 2000) ),
+            asyncio.create_task( ps4.write_int32(pid, 0x654210, 3000) ),
+        ]
+        
+        pending = tasks
+        while len(pending):
+            # We iterate until all tasks are done but we stop waiting and handle already finished tasks.
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                # Let's say the first task was something special and want its result, we can use 'is' for that:
+                # Note: If you use Coroutines, which are wrapped into tasks by asyncio. The following will not work.
+                response_code = await t
+                if t is tasks[0]:
+                    print('0x123456:', response_code)
+                else:
+                    print(response_code)
+
         # Remotely execute code (Code injection)
         async with ps4.memory(pid, 4096) as memory:
             # Write your own assembly code to the system
@@ -59,15 +79,17 @@ async def main(ip_address):
         # Attaching the debugger works similarly
         async with ps4.debugger(pid, resume=True) as debugger:
             # Inside this context, a server on port 755 is being run to listen for debugger events.
-            pass
+            pass  # Debugging features are not implemented yet ;)
 
 
 if __name__ == '__main__':
     # Normally you would use something like Typer for this
     args = sys.argv[1:]
-    ip_address = args[0] if len(args) else input('Enter the IP address of your PS4: ')
+    address = args[0] if len(args) else input('Enter the IP address of your PS4: ')
   
     # asyncio.run(main()) might throw an exception because of the ProactorEventLoop closing
     loop = asyncio.new_event_loop()
-    loop.run_until_complete(main(ip_address))
+    loop.run_until_complete(main(address))
 ```
+
+_Note: Do not run the above code as is. Depending on what game is running your system or the game might crash_
