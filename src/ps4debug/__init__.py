@@ -2,10 +2,12 @@ from .core import ResponseCode
 from .exceptions import PS4DebugException
 import ps4debug.core as core
 import ps4debug.commands as commands
+from typing import Callable
 import socket
 import struct
 import functools
 import asyncio
+import contextlib
 
 
 class AllocatedMemoryContext(object):
@@ -156,16 +158,49 @@ class DebuggingContext(object):
         count = int.from_bytes(count, 'little')
 
         data = await self.ps4debug.reader.read(count * 4)
-        return [int.from_bytes(data[i:i+4], 'little') for i in range(0, count * 4, 4)]
+        return [int.from_bytes(data[i:i + 4], 'little') for i in range(0, count * 4, 4)]
 
     async def __connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         addr = writer.get_extra_info('peername')
-        print(addr)
+        # TODO debug events
+
         while True:
             data = await reader.read(4)
             print(f"Received {data}")
             if reader.at_eof():
                 break
+
+
+class SocketPool(object):
+    def __init__(self, host: str, port: int, max_: int = 10):
+        super(SocketPool, self).__init__()
+        self.host = host
+        self.port = port
+        self.max_ = max_
+        self.pool = []
+        self.semaphore = asyncio.Semaphore(max_)
+
+    @property
+    def full(self):
+        return self.semaphore.locked()
+
+    @contextlib.asynccontextmanager
+    async def get_socket(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Get the next available socket reader/writer from the pool."""
+        async with self.semaphore:
+            try:
+                reader, writer = self.pool.pop()
+            except IndexError:
+                reader, writer = await asyncio.open_connection(self.host, self.port)
+
+            try:
+                yield reader, writer
+            finally:
+                self.pool.append((reader, writer))
+
+    def __del__(self):
+        for _, writer in self.pool:
+            writer.close()
 
 
 class PS4Debug(object):
@@ -182,10 +217,7 @@ class PS4Debug(object):
         if not host:
             raise PS4DebugException('No host given and no PS4 found in network')
 
-        self.endpoint = (host, port)
-        self.connected = False
-        self.reader: asyncio.StreamReader | None = None
-        self.writer: asyncio.StreamWriter | None = None
+        self.pool = SocketPool(host, port, 8)
 
         # Structs
         self.__header_struct = struct.Struct('<3I')
@@ -200,30 +232,27 @@ class PS4Debug(object):
         self.__memory_header_struct = struct.Struct('<iQI')
         self.__elf_struct = struct.Struct('<2I')
 
-    async def __aenter__(self):
-        await self.connect()
-        return self
-
-    async def __aexit__(self, type_, value, traceback):
-        await self.disconnect()
-
-    async def __recv_int32(self) -> int:
-        data = await self.__recv_all(4)
+    async def __recv_int32(self, reader: asyncio.StreamReader | None = None) -> int:
+        data = await self.__recv_all(4, reader=reader)
         data = int.from_bytes(data, 'little')
         return data
 
-    async def __recv_int64(self) -> int:
-        data = await self.__recv_all(8)
+    async def __recv_int64(self, reader: asyncio.StreamReader | None = None) -> int:
+        data = await self.__recv_all(8, reader=reader)
         data = int.from_bytes(data, 'little')
         return data
 
-    async def __recv_all(self, length) -> bytearray:
+    async def __recv_all(self, length, reader: asyncio.StreamReader | None = None) -> bytearray:
+        if reader is None:
+            async with self.pool.get_socket() as (reader, _):
+                return await self.__recv_all(length, reader=reader)
+
         received = 0
         data = bytearray()
 
         while received < length:
-            packet = await self.reader.read(length - received)
-            if self.reader.at_eof():
+            packet = await reader.read(length - received)
+            if reader.at_eof():
                 break
             received += len(packet)
             data.extend(packet)
@@ -303,39 +332,28 @@ class PS4Debug(object):
         """
         return DebuggingContext(self, pid, debug_port, resume)
 
-    async def get_status(self) -> ResponseCode:
-        status_bytes = await self.__recv_all(4)
+    async def get_status(self, reader: asyncio.StreamReader | None = None) -> ResponseCode:
+        status_bytes = await self.__recv_all(4, reader=reader)
         return ResponseCode.from_bytes(status_bytes)
 
-    async def send_command(self, code: int, payload=None, status=True) -> ResponseCode | None:
+    async def send_command(self, code: int, payload: bytes | bytearray | None = None, status: bool = True,
+                           reader: asyncio.StreamReader | None = None,
+                           writer: asyncio.StreamWriter | None = None) -> ResponseCode | None:
+        if reader is None or writer is None:
+            async with self.pool.get_socket() as (new_reader, new_writer):
+                return await self.send_command(code, payload, status,
+                                               reader=reader or new_reader,
+                                               writer=writer or new_writer)
+
         payload_length = len(payload) if payload else 0
         header = self.__create_header(code, payload_length)
 
-        self.writer.write(header)
-        await self.writer.drain()  # Might not needed
+        writer.write(header)
         if payload and len(payload):
-            self.writer.write(payload)
-            await self.writer.drain()
+            writer.write(payload)
+        await writer.drain()
 
-        return await self.get_status() if status else None
-
-    async def connect(self):
-        """
-        Connects to the PS4
-        @return: None
-        """
-        host, port = self.endpoint
-        self.reader, self.writer = await asyncio.open_connection(host, port)
-        self.connected = True
-
-    async def disconnect(self):
-        """
-        Disconnects from the PS4
-        @return: None
-        """
-        self.writer.close()
-        await self.writer.wait_closed()
-        self.connected = False
+        return await self.get_status(reader=reader) if status else None
 
     async def reboot(self):
         """
@@ -343,17 +361,17 @@ class PS4Debug(object):
         @return: None
         """
         await self.send_command(commands.CONSOLE_REBOOT)
-        await self.disconnect()
 
     async def get_version(self) -> str:
         """
         Gets the remote ps4debug version running on the PS4.
         @return: Version string
         """
-        await self.send_command(commands.VERSION, status=False)
+        async with self.pool.get_socket() as (reader, writer):
+            await self.send_command(commands.VERSION, status=False, reader=reader, writer=writer)
 
-        length = await self.__recv_int32()
-        version = await self.__recv_all(length)
+            length = await self.__recv_int32(reader=reader)
+            version = await self.__recv_all(length, reader=reader)
         return version.decode('ascii')
 
     async def get_console_info(self) -> ResponseCode:
@@ -361,7 +379,8 @@ class PS4Debug(object):
         Retrieves the console information
         @return: Response code
         """
-        return await self.send_command(commands.CONSOLE_INFO)
+        async with self.pool.get_socket() as (reader, writer):
+            return await self.send_command(commands.CONSOLE_INFO, reader=reader, writer=writer)
 
     async def print(self, text: str, encoding: str = 'utf8') -> ResponseCode:
         """
@@ -377,11 +396,12 @@ class PS4Debug(object):
         text = text.encode(encoding)
         text_length = len(text).to_bytes(4, 'little')
 
-        await self.send_command(commands.CONSOLE_PRINT, text_length, status=False)
-        self.writer.write(text)
-        await self.writer.drain()
+        async with self.pool.get_socket() as (reader, writer):
+            await self.send_command(commands.CONSOLE_PRINT, text_length, status=False, reader=reader, writer=writer)
+            writer.write(text)
+            await writer.drain()
 
-        return await self.get_status()
+            return await self.get_status(reader=reader)
 
     async def notify(self, text: str, notification_type: int = 222, encoding: str = 'utf8') -> ResponseCode:
         """
@@ -398,11 +418,12 @@ class PS4Debug(object):
         text = text.encode(encoding)
         payload = self.__notify_struct.pack(notification_type, len(text))
 
-        await self.send_command(commands.CONSOLE_NOTIFY, payload, status=False)
-        self.writer.write(text)
-        await self.writer.drain()
+        async with self.pool.get_socket() as (reader, writer):
+            await self.send_command(commands.CONSOLE_NOTIFY, payload, status=False, reader=reader, writer=writer)
+            writer.write(text)
+            await writer.drain()
 
-        return await self.get_status()
+            return await self.get_status(reader=reader)
 
     async def get_processes(self) -> list[core.Process]:
         """
@@ -415,14 +436,15 @@ class PS4Debug(object):
             name = name.rstrip(b'\x00').decode('ascii')
             return core.Process(name=name, pid=pid)
 
-        entry_size = 36
-        status = await self.send_command(commands.PROC_LIST)
+        async with self.pool.get_socket() as (reader, writer):
+            entry_size = 36
+            status = await self.send_command(commands.PROC_LIST, reader=reader, writer=writer)
 
-        if status != ResponseCode.SUCCESS:
-            return []
+            if status != ResponseCode.SUCCESS:
+                return []
 
-        count = await self.__recv_int32()
-        data = await self.__recv_all(count * entry_size)
+            count = await self.__recv_int32(reader=reader)
+            data = await self.__recv_all(count * entry_size, reader=reader)
 
         return [parse_entry(data[i:i + entry_size]) for i in range(0, count * entry_size, entry_size)]
 
@@ -432,15 +454,15 @@ class PS4Debug(object):
         @param pid: Process id
         @return: ProcessInfo instance or None if unsuccessful
         """
+        async with self.pool.get_socket() as (reader, writer):
+            entry_size = 188
+            pid_bytes = pid.to_bytes(4, 'little')
+            status = await self.send_command(commands.PROC_INFO, pid_bytes, reader=reader, writer=writer)
 
-        entry_size = 188
-        pid_bytes = pid.to_bytes(4, 'little')
-        status = await self.send_command(commands.PROC_INFO, pid_bytes)
+            if status != ResponseCode.SUCCESS:
+                return
 
-        if status != ResponseCode.SUCCESS:
-            return
-
-        data = await self.__recv_all(entry_size)
+            data = await self.__recv_all(entry_size, reader=reader)
 
         pid, name, path, title_id, content_id = self.__process_info_struct.unpack(data)
         name = name[:name.index(0)].decode('ascii')
@@ -463,15 +485,16 @@ class PS4Debug(object):
             name = entry_bytes[:name_end].decode('ascii')
             return core.ProcessMap(name=name, start=start, end=end, offset=offset, prot=prot)
 
-        entry_size = 58
-        payload = pid.to_bytes(4, 'little')
-        status = await self.send_command(commands.PROC_MAPS, payload)
+        async with self.pool.get_socket() as (reader, writer):
+            entry_size = 58
+            payload = pid.to_bytes(4, 'little')
+            status = await self.send_command(commands.PROC_MAPS, payload, reader=reader, writer=writer)
 
-        if status != ResponseCode.SUCCESS:
-            return []
+            if status != ResponseCode.SUCCESS:
+                return []
 
-        count = await self.__recv_int32()
-        data = await self.__recv_all(count * entry_size)
+            count = await self.__recv_int32(reader=reader)
+            data = await self.__recv_all(count * entry_size, reader=reader)
 
         return [parse_entry(data[i:i + entry_size]) for i in range(0, count * entry_size, entry_size)]
 
@@ -482,13 +505,14 @@ class PS4Debug(object):
         @param length: Length in bytes
         @return: The starting address of your memory section or None if the command failed.
         """
-        payload = self.__allocate_struct.pack(pid, length)
-        status = await self.send_command(commands.PROC_ALLOC, payload)
+        async with self.pool.get_socket() as (reader, writer):
+            payload = self.__allocate_struct.pack(pid, length)
+            status = await self.send_command(commands.PROC_ALLOC, payload, reader=reader, writer=writer)
 
-        if status != ResponseCode.SUCCESS:
-            return
+            if status != ResponseCode.SUCCESS:
+                return
 
-        address = await self.__recv_int64()
+            address = await self.__recv_int64(reader=reader)
         return address
 
     async def free_memory(self, pid: int, address: int, length: int) -> ResponseCode:
@@ -499,8 +523,9 @@ class PS4Debug(object):
         @param length: Length in bytes
         @return: Response code
         """
-        payload = self.__free_struct.pack(pid, address, length)
-        return await self.send_command(commands.PROC_FREE, payload)
+        async with self.pool.get_socket() as (reader, writer):
+            payload = self.__free_struct.pack(pid, address, length)
+            return await self.send_command(commands.PROC_FREE, payload, reader=reader, writer=writer)
 
     async def change_protection(self, pid: int, address: int, length: int, prot: core.VMProtection) -> ResponseCode:
         """
@@ -511,22 +536,31 @@ class PS4Debug(object):
         @param prot: New protection flags
         @return: Response code
         """
-        payload = self.__change_prot_struct.pack(pid, address, length, prot.value)
-        return await self.send_command(commands.PROC_PROTECT, payload)
+        async with self.pool.get_socket() as (reader, writer):
+            payload = self.__change_prot_struct.pack(pid, address, length, prot.value)
+            return await self.send_command(commands.PROC_PROTECT, payload, reader=reader, writer=writer)
 
-    async def install_rpc(self, pid: int) -> int | None:
+    async def install_rpc(self, pid: int,
+                          reader: asyncio.StreamReader | None = None,
+                          writer: asyncio.StreamWriter | None = None) -> int | None:
         """
         Writes a small program to the process' memory to allow execution of remote procedures
         @param pid: Process id
+        @param reader: StreamReader to use, leave empty to create a new one.
+        @param writer: StreamWriter to use, leave empty to create a new one.
         @return: The starting address of the RPC stub or None if the command failed.
         """
+        if reader is None or writer is None:
+            async with self.pool.get_socket() as (new_reader, new_writer):
+                return await self.install_rpc(pid, reader=reader or new_reader, writer=writer or new_writer)
+
         pid_bytes = pid.to_bytes(4, 'little')
-        status = await self.send_command(commands.PROC_INSTALL, pid_bytes)
+        status = await self.send_command(commands.PROC_INSTALL, pid_bytes, reader=reader, writer=writer)
 
         if status != ResponseCode.SUCCESS:
             return
 
-        return await self.__recv_int64()
+        return await self.__recv_int64(reader=reader)
 
     async def call(self, pid: int, address: int, *args, **kwargs) -> tuple | None:
         """
@@ -547,29 +581,30 @@ class PS4Debug(object):
         packet_size = 68
         result_size = 12
 
-        parameter_format = kwargs.get('parameter_format', f'<{len(args)}Q')
-        output_format = kwargs.get('output_format', '<Q')
-        rpc_stub = kwargs.get('rpc_stub', self.install_rpc(pid))
+        async with self.pool.get_socket() as (reader, writer):
+            parameter_format = kwargs.get('parameter_format', f'<{len(args)}Q')
+            output_format = kwargs.get('output_format', '<Q')
+            rpc_stub = kwargs.get('rpc_stub', await self.install_rpc(pid, reader=reader, writer=writer))
 
-        header_size = self.__call_header_struct.size
-        payload_buffer = bytearray(packet_size)
+            header_size = self.__call_header_struct.size
+            payload_buffer = bytearray(packet_size)
 
-        assert struct.calcsize(parameter_format) <= len(payload_buffer)
-        assert struct.calcsize(output_format) <= 8
+            assert struct.calcsize(parameter_format) <= len(payload_buffer)
+            assert struct.calcsize(output_format) <= 8
 
-        self.__call_header_struct.pack_into(payload_buffer, 0, pid, rpc_stub, address)
-        struct.pack_into(parameter_format, payload_buffer, header_size, *args)
+            self.__call_header_struct.pack_into(payload_buffer, 0, pid, rpc_stub, address)
+            struct.pack_into(parameter_format, payload_buffer, header_size, *args)
 
-        status = await self.send_command(commands.PROC_CALL, payload_buffer)
+            status = await self.send_command(commands.PROC_CALL, payload_buffer, reader=reader, writer=writer)
 
-        if status != ResponseCode.SUCCESS:
-            return
+            if status != ResponseCode.SUCCESS:
+                return
 
-        missing_bytes = 8 - struct.calcsize(output_format)
-        result = await self.__recv_all(result_size)
+            missing_bytes = 8 - struct.calcsize(output_format)
+            result = await self.__recv_all(result_size, reader=reader)
 
-        _ = int.from_bytes(result[:4], 'little')  # pid
-        rax = struct.unpack(output_format + 'x' * missing_bytes, result[4:])
+            _ = int.from_bytes(result[:4], 'little')  # pid
+            rax = struct.unpack(output_format + 'x' * missing_bytes, result[4:])
         return rax
 
     async def load_elf(self, pid: int, elf_path: str) -> ResponseCode:
@@ -582,31 +617,42 @@ class PS4Debug(object):
         with open(elf_path, 'rb') as file:
             elf_bytes = file.read()
 
-        payload = self.__elf_struct.pack(pid, len(elf_bytes))
-        status = await self.send_command(commands.PROC_ELF, payload)
+        async with self.pool.get_socket() as (reader, writer):
+            payload = self.__elf_struct.pack(pid, len(elf_bytes))
+            status = await self.send_command(commands.PROC_ELF, payload, reader=reader, writer=writer)
 
-        if status == ResponseCode.SUCCESS:
-            self.writer.write(elf_bytes)
-            await self.writer.drain()
-            status = self.get_status()
+            if status == ResponseCode.SUCCESS:
+                writer.write(elf_bytes)
+                await writer.drain()
+                status = await self.get_status(reader=reader)
 
         return status
 
-    async def read_memory(self, pid: int, address: int, length: int) -> bytearray | bytes | None:
+    async def read_memory(self, pid: int, address: int, length: int,
+                          reader: asyncio.StreamReader | None = None,
+                          writer: asyncio.StreamWriter | None = None) -> bytearray | bytes | None:
         """
         Reads the raw memory in bytes.
         @param pid: Process id.
         @param address: Starting address.
         @param length: Length in bytes.
+        @param reader: StreamReader to use, leave empty to create one.
+        @param writer: StreamWriter to use, leave empty to create one.
         @return: The bytes read or None if the command failed.
         """
+        if reader is None or writer is None:
+            async with self.pool.get_socket() as (new_reader, new_writer):
+                return await self.read_memory(pid, address, length,
+                                              reader=reader or new_reader,
+                                              writer=writer or new_writer)
+
         payload = self.__memory_header_struct.pack(pid, address, length)
-        status = await self.send_command(commands.PROC_READ, payload)
+        status = await self.send_command(commands.PROC_READ, payload, reader=reader, writer=writer)
 
         if status != ResponseCode.SUCCESS:
             return
 
-        return await self.__recv_all(length)
+        return await self.__recv_all(length, reader=reader)
 
     async def read_struct(self, pid: int, address: int, structure: str | struct.Struct) -> tuple | None:
         """
@@ -634,39 +680,50 @@ class PS4Debug(object):
         @keyword chunk_size: Used if length is unset. The chunk determines how much memory is read at a time.
         @return: Decoded string or None if the command failed
         """
-        length = kwargs.get('length')
-        if length:
-            data = await self.read_memory(pid, address, length)
+        async with self.pool.get_socket() as (reader, writer):
+            length = kwargs.get('length')
+            if length:
+                data = await self.read_memory(pid, address, length, reader=reader, writer=writer)
+                return data.decode(encoding)
+
+            chunk_size = kwargs.get('chunk_size', 64)
+            chunk = await self.read_memory(pid, address, chunk_size, reader=reader, writer=writer)
+            data = chunk
+
+            while b'\x00' not in chunk:
+                chunk = await self.read_memory(pid, address + len(data), chunk_size, reader=reader, writer=writer)
+                data += chunk
+
+            data = data[:data.index(b'\0')]
             return data.decode(encoding)
 
-        chunk_size = kwargs.get('chunk_size', 64)
-        chunk = await self.read_memory(pid, address, chunk_size)
-        data = chunk
-
-        while b'\x00' not in chunk:
-            chunk = await self.read_memory(pid, address + len(data), chunk_size)
-            data += chunk
-
-        data = data[:data.index(b'\0')]
-        return data.decode(encoding)
-
-    async def write_memory(self, pid: int, address: int, value: bytearray | bytes) -> ResponseCode:
+    async def write_memory(self, pid: int, address: int, value: bytearray | bytes,
+                           reader: asyncio.StreamReader | None = None,
+                           writer: asyncio.StreamWriter | None = None) -> ResponseCode:
         """
         Writes the raw memory in bytes to an address.
         @param pid: Process id.
         @param address: Starting address.
         @param value: Bytes to write.
+        @param reader: StreamReader to use, leave empty to create one.
+        @param writer: StreamWriter to use, leave empty to create one.
         @return: Response code.
         """
+        if reader is None or writer is None:
+            async with self.pool.get_socket() as (new_reader, new_writer):
+                return await self.write_memory(pid, address, value,
+                                               reader=reader or new_reader,
+                                               writer=writer or new_writer)
+
         payload = self.__memory_header_struct.pack(pid, address, len(value))
-        status = await self.send_command(commands.PROC_WRITE, payload)
+        status = await self.send_command(commands.PROC_WRITE, payload, reader=reader, writer=writer)
 
         if status != ResponseCode.SUCCESS:
             return status
 
-        self.writer.write(value)
-        await self.writer.drain()
-        return await self.get_status()
+        writer.write(value)
+        await writer.drain()
+        return await self.get_status(reader=reader)
 
     async def write_struct(self, pid: int, address: int, structure: str | struct.Struct, *value) -> ResponseCode:
         """
@@ -677,11 +734,12 @@ class PS4Debug(object):
         @param value: Struct data to write
         @return: Response code.
         """
-        if isinstance(structure, str):
-            structure = struct.Struct(structure)
+        async with self.pool.get_socket() as (reader, writer):
+            if isinstance(structure, str):
+                structure = struct.Struct(structure)
 
-        data = structure.pack(*value)
-        return await self.write_memory(pid, address, data)
+            data = structure.pack(*value)
+            return await self.write_memory(pid, address, data, reader=reader, writer=writer)
 
     async def write_text(self, pid: int, address: int, value: str, encoding: str = 'ascii') -> ResponseCode:
         """
@@ -692,40 +750,41 @@ class PS4Debug(object):
         @param encoding: Encoding to use.
         @return: Response code.
         """
-        if value is None:
-            return ResponseCode.DATA_NULL
+        async with self.pool.get_socket() as (reader, writer):
+            if value is None:
+                return ResponseCode.DATA_NULL
 
-        value += '' if value.endswith('\0') else '\0'
-        value = value.encode(encoding)
+            value += '' if value.endswith('\0') else '\0'
+            value = value.encode(encoding)
 
-        return await self.write_memory(pid, address, value)
+            return await self.write_memory(pid, address, value, reader=reader, writer=writer)
 
     # Wrappers
-    read_bool = functools.partialmethod(__read_type, structure='<?')
-    read_char = functools.partialmethod(__read_type, structure='<c')
-    read_byte = functools.partialmethod(__read_type, structure='<b')
-    read_ubyte = functools.partialmethod(__read_type, structure='<B')
-    read_int16 = functools.partialmethod(__read_type, structure='<h')
-    read_uint16 = functools.partialmethod(__read_type, structure='<H')
-    read_int32 = functools.partialmethod(__read_type, structure='<i')
-    read_uint32 = functools.partialmethod(__read_type, structure='<I')
-    read_int64 = functools.partialmethod(__read_type, structure='<q')
-    read_uint64 = functools.partialmethod(__read_type, structure='<Q')
-    read_float = functools.partialmethod(__read_type, structure='<f')
-    read_double = functools.partialmethod(__read_type, structure='<d')
+    read_bool: Callable[[int, int], bool] = functools.partialmethod(__read_type, structure='<?')
+    read_char: Callable[[int, int], str] = functools.partialmethod(__read_type, structure='<c')
+    read_byte: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<b')
+    read_ubyte: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<B')
+    read_int16: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<h')
+    read_uint16: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<H')
+    read_int32: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<i')
+    read_uint32: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<I')
+    read_int64: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<q')
+    read_uint64: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<Q')
+    read_float: Callable[[int, int], float] = functools.partialmethod(__read_type, structure='<f')
+    read_double: Callable[[int, int], float] = functools.partialmethod(__read_type, structure='<d')
 
-    write_bool = functools.partialmethod(__write_type, structure='<?')
-    write_char = functools.partialmethod(__write_type, structure='<c')
-    write_byte = functools.partialmethod(__write_type, structure='<b')
-    write_ubyte = functools.partialmethod(__write_type, structure='<B')
-    write_int16 = functools.partialmethod(__write_type, structure='<h')
-    write_uint16 = functools.partialmethod(__write_type, structure='<H')
-    write_int32 = functools.partialmethod(__write_type, structure='<i')
-    write_uint32 = functools.partialmethod(__write_type, structure='<I')
-    write_int64 = functools.partialmethod(__write_type, structure='<q')
-    write_uint64 = functools.partialmethod(__write_type, structure='<Q')
-    write_float = functools.partialmethod(__write_type, structure='<f')
-    write_double = functools.partialmethod(__write_type, structure='<d')
+    write_bool: Callable[[int, int, bool], ResponseCode] = functools.partialmethod(__write_type, structure='<?')
+    write_char: Callable[[int, int, str], ResponseCode] = functools.partialmethod(__write_type, structure='<c')
+    write_byte: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<b')
+    write_ubyte: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<B')
+    write_int16: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<h')
+    write_uint16: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<H')
+    write_int32: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<i')
+    write_uint32: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<I')
+    write_int64: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<q')
+    write_uint64: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<Q')
+    write_float: Callable[[int, int, float], ResponseCode] = functools.partialmethod(__write_type, structure='<f')
+    write_double: Callable[[int, int, float], ResponseCode] = functools.partialmethod(__write_type, structure='<d')
 
     # Unfinished
     def scan_int32(self, pid: int, compare_type: core.ScanCompareType, *values) -> list[int]:
@@ -786,7 +845,7 @@ class PS4Debug(object):
         pid = int.from_bytes(data[:4], 'little')
         priority = int.from_bytes(data[4:8], 'little')
         print(data)
-        #name = data[8:8+data.index(0, 8)].decode('ascii')
+        # name = data[8:8+data.index(0, 8)].decode('ascii')
 
         return core.ThreadInfo(pid=pid, priority=priority, name='')
 
