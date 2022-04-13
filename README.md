@@ -87,9 +87,14 @@ if __name__ == '__main__':
     args = sys.argv[1:]
     address = args[0] if len(args) else input('Enter the IP address of your PS4: ')
   
-    # asyncio.run(main()) might throw an exception because of the ProactorEventLoop closing
+    # asyncio.run(main()) might throw an exception because of the ProactorEventLoop closing on Windows
     loop = asyncio.new_event_loop()
     loop.run_until_complete(main(address))
+
+    # If you insist on using asyncio.run on Windows try to set the following snippet
+    if sys.platform:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
 ```
 
 _Note: Do not run the above code as is. Depending on what game is running your system or the game might crash_
