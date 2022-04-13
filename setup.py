@@ -6,7 +6,7 @@ with open('README.md', 'r', encoding='utf-8') as fh:
 
 setup(
     name='ps4debug',
-    version='0.0.7',
+    version='0.0.8',
     author='Jay',
     author_email='0jaybae0@gmail.com',
     description='Integrates into Future Tone on the PS4',
