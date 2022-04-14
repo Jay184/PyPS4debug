@@ -2,7 +2,7 @@ from .core import ResponseCode
 from .exceptions import PS4DebugException
 import ps4debug.core as core
 import ps4debug.commands as commands
-from typing import Callable
+from typing import Callable, Coroutine
 import socket
 import struct
 import functools
@@ -1082,31 +1082,31 @@ class PS4Debug(object):
             return await self.get_status(reader=reader)
 
     # Wrappers
-    read_bool: Callable[[int, int], bool] = functools.partialmethod(__read_type, structure='<?')
-    read_char: Callable[[int, int], str] = functools.partialmethod(__read_type, structure='<c')
-    read_byte: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<b')
-    read_ubyte: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<B')
-    read_int16: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<h')
-    read_uint16: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<H')
-    read_int32: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<i')
-    read_uint32: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<I')
-    read_int64: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<q')
-    read_uint64: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<Q')
-    read_float: Callable[[int, int], float] = functools.partialmethod(__read_type, structure='<f')
-    read_double: Callable[[int, int], float] = functools.partialmethod(__read_type, structure='<d')
+    read_bool: Callable[[int, int], Coroutine[bool]] = functools.partialmethod(__read_type, structure='<?')
+    read_char: Callable[[int, int], Coroutine[str]] = functools.partialmethod(__read_type, structure='<c')
+    read_byte: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<b')
+    read_ubyte: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<B')
+    read_int16: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<h')
+    read_uint16: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<H')
+    read_int32: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<i')
+    read_uint32: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<I')
+    read_int64: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<q')
+    read_uint64: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<Q')
+    read_float: Callable[[int, int], Coroutine[float]] = functools.partialmethod(__read_type, structure='<f')
+    read_double: Callable[[int, int], Coroutine[float]] = functools.partialmethod(__read_type, structure='<d')
 
-    write_bool: Callable[[int, int, bool], ResponseCode] = functools.partialmethod(__write_type, structure='<?')
-    write_char: Callable[[int, int, str], ResponseCode] = functools.partialmethod(__write_type, structure='<c')
-    write_byte: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<b')
-    write_ubyte: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<B')
-    write_int16: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<h')
-    write_uint16: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<H')
-    write_int32: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<i')
-    write_uint32: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<I')
-    write_int64: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<q')
-    write_uint64: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<Q')
-    write_float: Callable[[int, int, float], ResponseCode] = functools.partialmethod(__write_type, structure='<f')
-    write_double: Callable[[int, int, float], ResponseCode] = functools.partialmethod(__write_type, structure='<d')
+    write_bool: Callable[[int, int, bool], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<?')
+    write_char: Callable[[int, int, str], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<c')
+    write_byte: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<b')
+    write_ubyte: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<B')
+    write_int16: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<h')
+    write_uint16: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<H')
+    write_int32: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<i')
+    write_uint32: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<I')
+    write_int64: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<q')
+    write_uint64: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<Q')
+    write_float: Callable[[int, int, float], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<f')
+    write_double: Callable[[int, int, float], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<d')
 
     # Unfinished
     async def __scan_int32(self, pid: int, compare_type: core.ScanCompareType, *values) -> list[int]:
