@@ -8,12 +8,13 @@ import struct
 import functools
 import asyncio
 import contextlib
+import construct
 
 
 class AllocatedMemoryContext(object):
     """Context for handling memory allocation and freeing."""
 
-    def __init__(self, ps4debug, pid, length):
+    def __init__(self, ps4debug, pid, length, address):
         """
         Create a new allocated memory context.
         @param ps4debug: PS4Debug instance.
@@ -24,13 +25,7 @@ class AllocatedMemoryContext(object):
         self.ps4debug = ps4debug
         self.pid = pid
         self.length = length
-
-    async def __aenter__(self):
-        self.address = await self.ps4debug.allocate_memory(self.pid, self.length)
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.ps4debug.free_memory(self.pid, self.address, self.length)
+        self.address = address
 
     async def change_protection(self, prot: core.VMProtection) -> ResponseCode:
         """
@@ -76,102 +71,292 @@ class AllocatedMemoryContext(object):
 
 
 class DebuggingContext(object):
+    """Context for debugging operations."""
     max_breakpoints = 10
     max_watchpoints = 4
 
-    def __init__(self, ps4debug, pid: int, port: int = 755, resume: bool = False):
+    def __init__(self, ps4debug, pid: int):
         super(DebuggingContext, self).__init__()
         self.ps4debug: PS4Debug = ps4debug
-        self.port = port
         self.pid = pid
-        self.server = None
-        self.attached = False
-        self.__resume = resume
 
-    async def __aenter__(self):
-        await self.attach(self.pid, self.port, self.__resume)
-        return self
+        self.stop_flag = asyncio.Event()
+        self.callback = None
+        self.breakpoints = {i: (False, 0, None) for i in range(self.max_breakpoints)}
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.detach()
-
-    async def attach(self, pid: int, port: int = 755, resume: bool = False) -> ResponseCode:
+    def register_callback(self, func: Callable[[core.BreakpointEvent], None]) -> bool:
         """
-        Attaches the debugger to the process on the remote system and
-        causes it to connect to the debugger port of this machine.
-        Note that this will pause the processes on the system.
-        @param port: Port to listen for debug events on.
-        @param pid: Process id.
-        @param resume: If true, will automatically resume the processes.
-        @return: Response code.
+        Registers an asynchronous callback for all breakpoints. This callback is executed before the individual ones.
+        @param func: Asynchronous callback when a breakpoint is hit
+        @return: True if successful, False otherwise
         """
-        self.server = await asyncio.start_server(self.__connected, '0.0.0.0', port)
+        if func is not None and not asyncio.iscoroutinefunction(func):
+            return False
 
-        pid_bytes = pid.to_bytes(4, 'little')
-        status = await self.ps4debug.send_command(commands.DEBUG_ATTACH, pid_bytes)
-        self.attached = status == ResponseCode.SUCCESS
-
-        if not resume or status != ResponseCode.SUCCESS:
-            return status
-
-        return await self.resume_process()
-
-    async def detach(self) -> ResponseCode:
-        """
-        Detaches the debugger from the remote system.
-        @return: Response code.
-        """
-        self.attached = False
-        status = await self.ps4debug.send_command(commands.DEBUG_DETACH)
-
-        async with self.server:
-            self.server.close()
-            await self.server.wait_closed()
-
-        return status
+        self.callback = func
+        return True
 
     async def resume_process(self) -> ResponseCode:
         """
         Resumes all processes on the remote system.
         @return: Response code
         """
-        return await self.ps4debug.send_command(commands.DEBUG_STOPGO, b'\x00\x00\x00\x00')
+        data = construct.Int32ul.build(0)
+        return await self.ps4debug.send_command(commands.DEBUG_STOPGO, data)
 
     async def stop_process(self) -> ResponseCode:
         """
         Stops all processes on the remote system.
         @return: Response code
         """
-        return await self.ps4debug.send_command(commands.DEBUG_STOPGO, b'\x01\x00\x00\x00')
+        data = construct.Int32ul.build(1)
+        return await self.ps4debug.send_command(commands.DEBUG_STOPGO, data)
+
+    async def kill_process(self) -> ResponseCode:
+        """
+        Kills the debugging process.
+        @return: Response code
+        """
+        data = construct.Int32ul.build(2)
+        return await self.ps4debug.send_command(commands.DEBUG_STOPGO, data)
 
     async def get_threads(self) -> list[int]:
         """
         Retrieves a list of threads in the debugging process
         @return: List of thread ids.
         """
-        status = await self.ps4debug.send_command(commands.DEBUG_THREADS)
+        async with self.ps4debug.pool.get_socket() as (reader, writer):
+            status = await self.ps4debug.send_command(commands.DEBUG_THREADS, reader=reader, writer=writer)
 
-        if status != ResponseCode.SUCCESS:
-            return []
+            if status != ResponseCode.SUCCESS:
+                return []
 
-        count = await self.ps4debug.reader.read(4)
-        count = int.from_bytes(count, 'little')
+            count = await reader.readexactly(4)
+            count = int.from_bytes(count, 'little')
 
-        data = await self.ps4debug.reader.read(count * 4)
-        return [int.from_bytes(data[i:i + 4], 'little') for i in range(0, count * 4, 4)]
+            data = await reader.readexactly(count * 4)
+        return list(construct.Int32ul[count].parse(data))
 
-    async def __connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        addr = writer.get_extra_info('peername')
-        # TODO debug events
+    async def get_thread_info(self, thread_id: int) -> core.ThreadInfo:
+        """
+        Get information about a specific thread
+        @param thread_id: Thread id
+        @return: ThreadInfo
+        """
+        id_bytes = int.to_bytes(4, thread_id, 'little')
 
-        while True:
-            data = await reader.read(4)
-            print(f"Received {data}")
-            if reader.at_eof():
-                break
+        async with self.ps4debug.pool.get_socket() as (reader, writer):
+            await self.ps4debug.send_command(commands.DEBUG_THRINFO, id_bytes, reader=reader, writer=writer)
+            data = await reader.readexactly(core.ThreadInfo.sizeof())
+
+        return core.ThreadInfo.parse(data)
+
+    async def resume_thread(self, thread_id: int) -> ResponseCode:
+        """
+        Continues a thread's execution.
+        @param thread_id: Thread id
+        @return: Response code
+        """
+        # TODO not yet working
+        data = construct.Int32ul.build(thread_id)
+        return await self.ps4debug.send_command(commands.DEBUG_RESUMETHR, data)
+
+    async def stop_thread(self, thread_id: int) -> ResponseCode:
+        """
+        Stops a thread's execution.
+        @param thread_id: Thread id
+        @return: Response code
+        """
+        # TODO not yet working
+        data = construct.Int32ul.build(thread_id)
+        return await self.ps4debug.send_command(commands.DEBUG_STOPTHR, data)
+
+    async def get_registers(self, thread_id: int) -> core.Registers64:
+        """
+        Get the registers of the thread.
+        @param thread_id: Thread id
+        @return: Registers
+        """
+        async with self.ps4debug.pool.get_socket() as (reader, writer):
+            data = construct.Int32ul.build(thread_id)
+            status = await self.ps4debug.send_command(commands.DEBUG_GETREGS, data, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return
+
+            data = await reader.readexactly(core.Registers64.sizeof())
+            return core.Registers64.parse(data)
+
+    async def set_registers(self, thread_id: int, registers: core.Registers64) -> ResponseCode:
+        """
+        Manipulates the remote thread's registers.
+        @param thread_id: Thread id
+        @param registers: Full registers to write to the thread
+        @return: Response code
+        """
+        async with self.ps4debug.pool.get_socket() as (reader, writer):
+            data = core.SetRegisterPayload.build({'thread_id': thread_id, 'size': core.Registers64.sizeof()})
+            status = await self.ps4debug.send_command(commands.DEBUG_SETREGS, data, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return status
+
+            writer.write(core.Registers64.build(registers))
+            await writer.drain()
+            return await self.ps4debug.get_status(reader=reader)
+
+    async def get_fp_registers(self, thread_id: int) -> core.FPRegisters:
+        """
+        Get the registers of the thread.
+        @param thread_id: Thread id
+        @return: Registers
+        """
+        async with self.ps4debug.pool.get_socket() as (reader, writer):
+            data = construct.Int32ul.build(thread_id)
+            status = await self.ps4debug.send_command(commands.DEBUG_GETFPREGS, data, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return
+
+            data = await reader.readexactly(core.FPRegisters.sizeof())
+            return core.FPRegisters.parse(data)
+
+    async def set_fp_registers(self, thread_id: int, registers: core.FPRegisters) -> ResponseCode:
+        """
+        Manipulates the remote thread's registers.
+        @param thread_id: Thread id
+        @param registers: Full registers to write to the thread
+        @return: Response code
+        """
+        async with self.ps4debug.pool.get_socket() as (reader, writer):
+            data = core.SetRegisterPayload.build({'thread_id': thread_id, 'size': core.FPRegisters.sizeof()})
+            status = await self.ps4debug.send_command(commands.DEBUG_SETFPREGS, data, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return status
+
+            writer.write(core.FPRegisters.build(registers))
+            await writer.drain()
+            return await self.ps4debug.get_status(reader=reader)
+
+    async def get_debug_registers(self, thread_id: int) -> core.DebugRegisters:
+        """
+        Get the registers of the thread.
+        @param thread_id: Thread id
+        @return: Registers
+        """
+        async with self.ps4debug.pool.get_socket() as (reader, writer):
+            data = construct.Int32ul.build(thread_id)
+            status = await self.ps4debug.send_command(commands.DEBUG_GETDBGREGS, data, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return
+
+            data = await reader.readexactly(core.DebugRegisters.sizeof())
+            return core.DebugRegisters.parse(data)
+
+    async def set_debug_registers(self, thread_id: int, registers: core.DebugRegisters) -> ResponseCode:
+        """
+        Manipulates the remote thread's registers.
+        @param thread_id: Thread id
+        @param registers: Full registers to write to the thread
+        @return: Response code
+        """
+        async with self.ps4debug.pool.get_socket() as (reader, writer):
+            data = core.SetRegisterPayload.build({'thread_id': thread_id, 'size': core.DebugRegisters.sizeof()})
+            status = await self.ps4debug.send_command(commands.DEBUG_SETDBGREGS, data, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return status
+
+            writer.write(core.DebugRegisters.build(registers))
+            await writer.drain()
+            return await self.ps4debug.get_status(reader=reader)
+
+    def get_breakpoint(self, index: int):
+        assert 0 <= index < self.max_breakpoints
+        return self.breakpoints[index]
+
+    async def set_breakpoint(self, index: int, enabled: bool, address: int,
+                             on_hit: Callable[[core.BreakpointEvent], None]) -> ResponseCode:
+        """
+        Sets a software breakpoint.
+        @param index: Software breakpoint to use. 0 to 9 are valid.
+        @param enabled: If False, disables the breakpoint
+        @param address: Address to tie the breakpoint to
+        @param on_hit: Asynchronous callback when this breakpoint is hit
+        @return: Response code
+        """
+        if on_hit is not None and not asyncio.iscoroutinefunction(on_hit):
+            return ResponseCode.ERROR
+
+        assert 0 <= index < self.max_breakpoints
+        data = core.SetBreakpointPayload.build({'index': index, 'enabled': enabled, 'address': address})
+        status = await self.ps4debug.send_command(commands.DEBUG_BREAKPT, data)
+
+        if status == ResponseCode.SUCCESS:
+            self.breakpoints[index] = (enabled, address, on_hit)
+
+        return status
+
+    async def set_watchpoint(self, index: int, enabled: bool, address: int,
+                             length: core.WatchPointLengthType = core.WatchPointLengthType.DBREG_DR7_LEN_1,
+                             type_: core.WatchPointBreakType = core.WatchPointBreakType.DBREG_DR7_RDWR) -> ResponseCode:
+        """
+        Sets a hardware breakpoint to track a specific address for access/writes or executions.
+        @param index: Hardware breakpoint to use. 0 to 3 are valid.
+        @param enabled: If False, disables the breakpoint
+        @param address: Address to tie the breakpoint to
+        @param length: Length in bytes
+        @param type_: Breakpoint type
+        @return: Response code
+        """
+        assert 0 <= index < self.max_watchpoints
+        data = core.SetWatchpointPayload.build({
+            'index': index,
+            'enabled': enabled,
+            'length': length.value,
+            'type': type_.value,
+            'address': address,
+        })
+        return await self.ps4debug.send_command(commands.DEBUG_WATCHPT, data)
+
+    async def single_step(self) -> ResponseCode:
+        """
+        Performs a single step in the remote process.
+        @return: Response code
+        """
+        return await self.ps4debug.send_command(commands.DEBUG_SINGLESTEP)
+
+    async def debug_connected(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        length = core.DebuggerInterrupt.sizeof()
+
+        while not self.stop_flag.is_set():
+            try:
+                data = await reader.readexactly(length)
+                assert len(data) == length
+
+                interrupt = core.DebuggerInterrupt.parse(data)
+                index = next(i for i, b in self.breakpoints.items() if b[0] and b[1] == interrupt.regs.rip)
+                event = core.BreakpointEvent(self, index, interrupt)
+
+                if self.callback is not None:
+                    await self.callback(event)
+
+                if self.breakpoints[index][2] is not None:
+                    await self.breakpoints[index][2](event)
+
+                if event.resume:
+                    await self.resume_process()
+
+            except asyncio.IncompleteReadError:
+                writer.close()
+                return
 
 
 class SocketPool(object):
+    """Pools a set amount of sockets using semaphores."""
+
     def __init__(self, host: str, port: int, max_: int = 10):
         super(SocketPool, self).__init__()
         self.host = host
@@ -181,7 +366,8 @@ class SocketPool(object):
         self.semaphore = asyncio.Semaphore(max_)
 
     @property
-    def full(self):
+    def full(self) -> bool:
+        """Returns true if all sockets are in use"""
         return self.semaphore.locked()
 
     @contextlib.asynccontextmanager
@@ -204,8 +390,7 @@ class SocketPool(object):
 
 
 class PS4Debug(object):
-    """Offers standard ps4debug methods."""
-    magic = 0xFFAABBCC
+    """Offers functions to communicate with the ps4debug payload."""
 
     def __init__(self, host: str = None, port: int = 744):
         """
@@ -217,30 +402,8 @@ class PS4Debug(object):
         if not host:
             raise PS4DebugException('No host given and no PS4 found in network')
 
+        self.debug_server = None
         self.pool = SocketPool(host, port, 8)
-
-        # Structs
-        self.__header_struct = struct.Struct('<3I')
-        self.__notify_struct = struct.Struct('<2I')
-        self.__process_struct = struct.Struct('<32sI')
-        self.__process_map_struct = struct.Struct('<32s3QH')
-        self.__process_info_struct = struct.Struct('<i40s64s16s64s')
-        self.__allocate_struct = struct.Struct('<2I')
-        self.__free_struct = struct.Struct('<iQI')
-        self.__change_prot_struct = struct.Struct('<iQ2I')
-        self.__call_header_struct = struct.Struct('<i2Q')
-        self.__memory_header_struct = struct.Struct('<iQI')
-        self.__elf_struct = struct.Struct('<2I')
-
-    async def __recv_int32(self, reader: asyncio.StreamReader | None = None) -> int:
-        data = await self.__recv_all(4, reader=reader)
-        data = int.from_bytes(data, 'little')
-        return data
-
-    async def __recv_int64(self, reader: asyncio.StreamReader | None = None) -> int:
-        data = await self.__recv_all(8, reader=reader)
-        data = int.from_bytes(data, 'little')
-        return data
 
     async def __recv_all(self, length, reader: asyncio.StreamReader | None = None) -> bytearray:
         if reader is None:
@@ -262,16 +425,6 @@ class PS4Debug(object):
 
         return data
 
-    def __create_header(self, code, payload_length) -> bytes:
-        """
-        Creates the PS4Debug header (magic, command, payload length)
-        @param code: PS4 debug command constant
-        @param payload_length: Amount of parameters for the command
-        @return: Bytes of the header
-        """
-        header = self.__header_struct.pack(self.magic, code, payload_length)
-        return header
-
     async def __read_type(self, pid, address, structure):
         return (await self.read_struct(pid, address, structure))[0]
 
@@ -280,6 +433,10 @@ class PS4Debug(object):
 
     @classmethod
     def find_ps4(cls) -> str | None:
+        """
+        Attempts to find the IP address of the PlayStation 4 system in the same network.
+        @return: String or None
+        """
         # TODO make async
         magic = 0xFFFFAAAA
         data = magic.to_bytes(4, 'little')
@@ -304,6 +461,13 @@ class PS4Debug(object):
 
     @staticmethod
     async def send_ps4debug(host: str, port: int = 9020, file_path: str = 'ps4debug.bin'):
+        """
+        Sends the ps4debug 1.0.15 by ctn and golden to the PlayStation 4 system.
+        @param host: Host to send the payload to.
+        @param port: Port to send the payload to. Usually 9020 or 9090 (GoldHEN).
+        @param file_path: File path to the ps4debug.bin file.
+        @return: None
+        """
         with open(file_path, 'rb') as f:
             content = f.read()
 
@@ -313,32 +477,73 @@ class PS4Debug(object):
         writer.close()
         await writer.wait_closed()
 
-    def memory(self, pid, length) -> AllocatedMemoryContext:
+    @contextlib.asynccontextmanager
+    async def memory(self, pid, length) -> AllocatedMemoryContext:
         """
         Context manager to manage allocated memory
         @param pid: Process id
         @param length: Length in bytes to allocate
         @return: A context to manage the allocated memory
         """
-        return AllocatedMemoryContext(self, pid, length)
+        address = await self.allocate_memory(pid, length)
+        yield AllocatedMemoryContext(self, pid, length, address)
+        await self.free_memory(pid, address, length)
 
-    def debugger(self, pid: int, debug_port: int = 755, resume: bool = False) -> DebuggingContext:
+    @contextlib.asynccontextmanager
+    async def debugger(self, pid, port: int = 755, resume: bool = False) -> DebuggingContext:
         """
         Returns a debugging context to use for debugging a process
-        @param debug_port: Port the server should listen to debug events on.
+        @param port: Port the server should listen to debug events on.
         @param pid: Process id
         @param resume: If true, will automatically resume the processes.
         @return: Debugging context
         """
-        return DebuggingContext(self, pid, debug_port, resume)
+        context = DebuggingContext(self, pid)
+
+        if self.debug_server is None:
+            self.debug_server = await asyncio.start_server(context.debug_connected, '0.0.0.0', port)
+
+        pid_bytes = pid.to_bytes(4, 'little')
+        status = await self.send_command(commands.DEBUG_ATTACH, pid_bytes)
+
+        if status != ResponseCode.SUCCESS:
+            yield
+
+        if resume:
+            await context.resume_process()
+
+        yield context
+
+        status = await self.send_command(commands.DEBUG_DETACH)
+
+        if status == ResponseCode.SUCCESS:
+            context.stop_flag.set()
+
+            async with self.debug_server:
+                self.debug_server.close()
+                await self.debug_server.wait_closed()
 
     async def get_status(self, reader: asyncio.StreamReader | None = None) -> ResponseCode:
+        """
+        Returns the ps4debug status code. Do not use when not necessary as it blocks the IO.
+        @param reader: StreamReader instance. If None, a new one is created.
+        @return: Response code
+        """
         status_bytes = await self.__recv_all(4, reader=reader)
         return ResponseCode.from_bytes(status_bytes)
 
     async def send_command(self, code: int, payload: bytes | bytearray | None = None, status: bool = True,
                            reader: asyncio.StreamReader | None = None,
                            writer: asyncio.StreamWriter | None = None) -> ResponseCode | None:
+        """
+        Sends a raw ps4debug command to the system.
+        @param code: Command
+        @param payload: Extra data
+        @param status: If True, calls get_status and returns the status.
+        @param reader: StreamReader instance. If None, a new one is created.
+        @param writer: StreamWriter instance. If None, a new one is created.
+        @return:
+        """
         if reader is None or writer is None:
             async with self.pool.get_socket() as (new_reader, new_writer):
                 return await self.send_command(code, payload, status,
@@ -346,7 +551,7 @@ class PS4Debug(object):
                                                writer=writer or new_writer)
 
         payload_length = len(payload) if payload else 0
-        header = self.__create_header(code, payload_length)
+        header = core.PS4DebugCommandHeader.build({'code': code, 'length': payload_length})
 
         writer.write(header)
         if payload and len(payload):
@@ -370,7 +575,7 @@ class PS4Debug(object):
         async with self.pool.get_socket() as (reader, writer):
             await self.send_command(commands.VERSION, status=False, reader=reader, writer=writer)
 
-            length = await self.__recv_int32(reader=reader)
+            length = construct.Int32ul.parse(await self.__recv_all(4, reader=reader))
             version = await self.__recv_all(length, reader=reader)
         return version.decode('ascii')
 
@@ -406,7 +611,7 @@ class PS4Debug(object):
     async def notify(self, text: str, notification_type: int = 222, encoding: str = 'utf8') -> ResponseCode:
         """
         Send a notification popup to
-        @param text: Text to print
+        @param text: Text to display
         @param notification_type: Type of notification to display. 222 represents the text without any formatting.
         @param encoding: Encoding to use
         @return: Response code
@@ -416,7 +621,10 @@ class PS4Debug(object):
 
         text += '' if text.endswith('\0') else '\0'
         text = text.encode(encoding)
-        payload = self.__notify_struct.pack(notification_type, len(text))
+        payload = core.NotifyPayload.build({
+            'type': notification_type,
+            'length': len(text)
+        })
 
         async with self.pool.get_socket() as (reader, writer):
             await self.send_command(commands.CONSOLE_NOTIFY, payload, status=False, reader=reader, writer=writer)
@@ -430,47 +638,34 @@ class PS4Debug(object):
         Retrieves a list of processes running on the system.
         @return: List of Process instances. The list will be empty if the command failed.
         """
-
-        def parse_entry(entry_bytes) -> core.Process:
-            name, pid = self.__process_struct.unpack(entry_bytes)
-            name = name.rstrip(b'\x00').decode('ascii')
-            return core.Process(name=name, pid=pid)
-
         async with self.pool.get_socket() as (reader, writer):
-            entry_size = 36
+            entry_size = core.Process.sizeof()
             status = await self.send_command(commands.PROC_LIST, reader=reader, writer=writer)
 
             if status != ResponseCode.SUCCESS:
                 return []
 
-            count = await self.__recv_int32(reader=reader)
+            count = construct.Int32ul.parse(await self.__recv_all(4, reader=reader))
             data = await self.__recv_all(count * entry_size, reader=reader)
 
-        return [parse_entry(data[i:i + entry_size]) for i in range(0, count * entry_size, entry_size)]
+        return list(construct.Array(count, core.Process).parse(data))
 
-    async def get_process_info(self, pid: int) -> core.ProcessInfo | None:
+    async def get_process_info(self, pid: int) -> core.ProcessInfo:
         """
         Retrieves information about a running process.
         @param pid: Process id
         @return: ProcessInfo instance or None if unsuccessful
         """
         async with self.pool.get_socket() as (reader, writer):
-            entry_size = 188
-            pid_bytes = pid.to_bytes(4, 'little')
-            status = await self.send_command(commands.PROC_INFO, pid_bytes, reader=reader, writer=writer)
+            entry_size = core.ProcessInfo.sizeof()
+            data = construct.Int32ul.build(pid)
+            status = await self.send_command(commands.PROC_INFO, data, reader=reader, writer=writer)
 
             if status != ResponseCode.SUCCESS:
                 return
 
             data = await self.__recv_all(entry_size, reader=reader)
-
-        pid, name, path, title_id, content_id = self.__process_info_struct.unpack(data)
-        name = name[:name.index(0)].decode('ascii')
-        path = path[:path.index(0)].decode('ascii')
-        title_id = title_id[:title_id.index(0)].decode('ascii')
-        content_id = content_id[:content_id.index(0)].decode('ascii')
-
-        return core.ProcessInfo(pid=pid, name=name, path=path, title_id=title_id, content_id=content_id)
+        return core.ProcessInfo.parse(data)
 
     async def get_process_maps(self, pid: int) -> list[core.ProcessMap]:
         """
@@ -478,13 +673,6 @@ class PS4Debug(object):
         @param pid: Process id
         @return: List of ProcessMap instances. The list will be empty if the command failed.
         """
-
-        def parse_entry(entry_bytes) -> core.ProcessMap:
-            name, start, end, offset, prot = self.__process_map_struct.unpack(entry_bytes)
-            name_end = name.index(0)
-            name = entry_bytes[:name_end].decode('ascii')
-            return core.ProcessMap(name=name, start=start, end=end, offset=offset, prot=prot)
-
         async with self.pool.get_socket() as (reader, writer):
             entry_size = 58
             payload = pid.to_bytes(4, 'little')
@@ -493,10 +681,11 @@ class PS4Debug(object):
             if status != ResponseCode.SUCCESS:
                 return []
 
-            count = await self.__recv_int32(reader=reader)
+            count = construct.Int32ul.parse(await self.__recv_all(4, reader=reader))
             data = await self.__recv_all(count * entry_size, reader=reader)
 
-        return [parse_entry(data[i:i + entry_size]) for i in range(0, count * entry_size, entry_size)]
+        maps = list(construct.Array(count, core.ProcessMap).parse(data))
+        return maps
 
     async def allocate_memory(self, pid: int, length: int) -> int | None:
         """
@@ -506,13 +695,13 @@ class PS4Debug(object):
         @return: The starting address of your memory section or None if the command failed.
         """
         async with self.pool.get_socket() as (reader, writer):
-            payload = self.__allocate_struct.pack(pid, length)
+            payload = core.AllocateMemoryPayload.build({'pid': pid, 'length': length})
             status = await self.send_command(commands.PROC_ALLOC, payload, reader=reader, writer=writer)
 
             if status != ResponseCode.SUCCESS:
                 return
 
-            address = await self.__recv_int64(reader=reader)
+            address = construct.Int64ul.parse(await self.__recv_all(8, reader=reader))
         return address
 
     async def free_memory(self, pid: int, address: int, length: int) -> ResponseCode:
@@ -524,7 +713,7 @@ class PS4Debug(object):
         @return: Response code
         """
         async with self.pool.get_socket() as (reader, writer):
-            payload = self.__free_struct.pack(pid, address, length)
+            payload = core.FreeMemoryPayload.build({'pid': pid, 'address': address, 'length': length})
             return await self.send_command(commands.PROC_FREE, payload, reader=reader, writer=writer)
 
     async def change_protection(self, pid: int, address: int, length: int, prot: core.VMProtection) -> ResponseCode:
@@ -537,7 +726,12 @@ class PS4Debug(object):
         @return: Response code
         """
         async with self.pool.get_socket() as (reader, writer):
-            payload = self.__change_prot_struct.pack(pid, address, length, prot.value)
+            payload = core.ChangeMemoryProtectionPayload.build({
+                'pid': pid,
+                'address': address,
+                'length': length,
+                'prot': prot.value,
+            })
             return await self.send_command(commands.PROC_PROTECT, payload, reader=reader, writer=writer)
 
     async def install_rpc(self, pid: int,
@@ -560,7 +754,52 @@ class PS4Debug(object):
         if status != ResponseCode.SUCCESS:
             return
 
-        return await self.__recv_int64(reader=reader)
+        return construct.Int64ul.parse(await self.__recv_all(8, reader=reader))
+
+    async def find_rpc(self, pid: int, start: int = 0x4000, end: int = 0xFFFFFFFF, step: int = 0x4000,
+                       reader: asyncio.StreamReader | None = None,
+                       writer: asyncio.StreamWriter | None = None) -> int | None:
+        """
+        Attempts to find the RPC-stub in the remote memory.
+        @param pid: Process id
+        @param start: Start address
+        @param end: End address.
+        @param step: Increment between search.
+        @param reader: StreamReader to use, leave empty to create a new one.
+        @param writer: StreamWriter to use, leave empty to create a new one.
+        @return: Address of the RPC-stub if successful, otherwise None.
+        """
+        if reader is None or writer is None:
+            async with self.pool.get_socket() as (new_reader, new_writer):
+                return await self.find_rpc(pid, start, end, step,
+                                           reader=reader or new_reader,
+                                           writer=writer or new_writer)
+
+        search = b'\x52\x53\x54\x42\xA3'
+        address = start
+        while address < end:
+            bytes_ = await self.read_memory(pid, address, len(search), reader=reader, writer=writer)
+            if bytes_ == search:
+                return address
+            address += step
+        return
+
+    async def get_rpc(self, pid: int,
+                      reader: asyncio.StreamReader | None = None,
+                      writer: asyncio.StreamWriter | None = None) -> int | None:
+        """
+        Finds or installs the RPC-stub and returns the address
+        @param pid: Process id
+        @param reader: StreamReader to use, leave empty to create a new one.
+        @param writer: StreamWriter to use, leave empty to create a new one.
+        @return: Address of the RPC-stub or None if unsuccessful
+        """
+        if reader is None or writer is None:
+            async with self.pool.get_socket() as (new_reader, new_writer):
+                return await self.get_rpc(pid, reader=reader or new_reader, writer=writer or new_writer)
+
+        return (await self.find_rpc(pid, reader=reader, writer=writer) or
+                await self.install_rpc(pid, reader=reader, writer=writer))
 
     async def call(self, pid: int, address: int, *args, **kwargs) -> tuple | None:
         """
@@ -578,34 +817,39 @@ class PS4Debug(object):
         @return: rax register unpacked with the output_format or None if the command failed.
             Do note that the result will always be a tuple, even if the result is only one element.
         """
-        packet_size = 68
-        result_size = 12
-
         async with self.pool.get_socket() as (reader, writer):
             parameter_format = kwargs.get('parameter_format', f'<{len(args)}Q')
             output_format = kwargs.get('output_format', '<Q')
-            rpc_stub = kwargs.get('rpc_stub', await self.install_rpc(pid, reader=reader, writer=writer))
+            rpc_stub = kwargs.get('rpc_stub')
+            rpc_stub = rpc_stub or self.get_rpc(pid, reader=reader, writer=writer)
 
-            header_size = self.__call_header_struct.size
-            payload_buffer = bytearray(packet_size)
+            assert struct.calcsize(parameter_format) <= core.CallPayload.parameters.sizeof()
+            assert struct.calcsize(output_format) <= core.CallResult.rax.sizeof()
 
-            assert struct.calcsize(parameter_format) <= len(payload_buffer)
-            assert struct.calcsize(output_format) <= 8
+            parameters = bytearray(core.CallPayload.parameters.sizeof())
+            struct.pack_into(parameter_format, parameters, 0, *args)
 
-            self.__call_header_struct.pack_into(payload_buffer, 0, pid, rpc_stub, address)
-            struct.pack_into(parameter_format, payload_buffer, header_size, *args)
+            data = core.CallPayload.build({
+                'pid': pid,
+                'rpc_stub': rpc_stub,
+                'address': address,
+                'parameters': parameters,
+            })
 
-            status = await self.send_command(commands.PROC_CALL, payload_buffer, reader=reader, writer=writer)
+            status = await self.send_command(commands.PROC_CALL, data, reader=reader, writer=writer)
 
             if status != ResponseCode.SUCCESS:
                 return
 
-            missing_bytes = 8 - struct.calcsize(output_format)
-            result = await self.__recv_all(result_size, reader=reader)
+            result = await self.__recv_all(core.CallResult.sizeof(), reader=reader)
+            result = core.CallResult.parse(result)
 
-            _ = int.from_bytes(result[:4], 'little')  # pid
-            rax = struct.unpack(output_format + 'x' * missing_bytes, result[4:])
-        return rax
+            missing_bytes = 8 - struct.calcsize(output_format)
+            output_format += 'x' * missing_bytes
+
+            rax = bytearray(result.rax)
+            rax = struct.unpack_from(output_format, rax, 0)
+            return rax
 
     async def load_elf(self, pid: int, elf_path: str) -> ResponseCode:
         """
@@ -618,7 +862,10 @@ class PS4Debug(object):
             elf_bytes = file.read()
 
         async with self.pool.get_socket() as (reader, writer):
-            payload = self.__elf_struct.pack(pid, len(elf_bytes))
+            payload = core.LoadELFPayload.build({
+                'pid': pid,
+                'length': len(elf_bytes)
+            })
             status = await self.send_command(commands.PROC_ELF, payload, reader=reader, writer=writer)
 
             if status == ResponseCode.SUCCESS:
@@ -646,7 +893,11 @@ class PS4Debug(object):
                                               reader=reader or new_reader,
                                               writer=writer or new_writer)
 
-        payload = self.__memory_header_struct.pack(pid, address, length)
+        payload = core.MemoryPayload.build({
+            'pid': pid,
+            'address': address,
+            'length': length,
+        })
         status = await self.send_command(commands.PROC_READ, payload, reader=reader, writer=writer)
 
         if status != ResponseCode.SUCCESS:
@@ -654,7 +905,8 @@ class PS4Debug(object):
 
         return await self.__recv_all(length, reader=reader)
 
-    async def read_struct(self, pid: int, address: int, structure: str | struct.Struct) -> tuple | None:
+    async def read_struct(self, pid: int, address: int,
+                          structure: str | struct.Struct | construct.Struct) -> tuple | construct.Container | None:
         """
         Reads a struct from memory.
         @param pid: Process id.
@@ -663,11 +915,17 @@ class PS4Debug(object):
         @return: Your desired struct or None if the command failed.
             The return value will always be packed in a tuple regardless of length.
         """
-        if isinstance(structure, str):
-            structure = struct.Struct(structure)
-
         data = await self.read_memory(pid, address, structure.size)
-        return structure.unpack(data) if data else None
+
+        if data is None:
+            return
+
+        if isinstance(structure, construct.Struct):
+            return structure.parse(data)
+        elif isinstance(structure, struct.Struct):
+            return structure.unpack(data)
+        elif isinstance(structure, str):
+            return struct.unpack(structure, data)
 
     async def read_text(self, pid: int, address: int, encoding: str = 'ascii', **kwargs) -> str | None:
         """
@@ -715,7 +973,11 @@ class PS4Debug(object):
                                                reader=reader or new_reader,
                                                writer=writer or new_writer)
 
-        payload = self.__memory_header_struct.pack(pid, address, len(value))
+        payload = core.MemoryPayload.build({
+            'pid': pid,
+            'address': address,
+            'length': len(value),
+        })
         status = await self.send_command(commands.PROC_WRITE, payload, reader=reader, writer=writer)
 
         if status != ResponseCode.SUCCESS:
@@ -725,7 +987,8 @@ class PS4Debug(object):
         await writer.drain()
         return await self.get_status(reader=reader)
 
-    async def write_struct(self, pid: int, address: int, structure: str | struct.Struct, *value) -> ResponseCode:
+    async def write_struct(self, pid: int, address: int,
+                           structure: str | struct.Struct | construct.Struct, *value) -> ResponseCode:
         """
         Writes a struct to an address.
         @param pid: Process id.
@@ -734,11 +997,16 @@ class PS4Debug(object):
         @param value: Struct data to write
         @return: Response code.
         """
-        async with self.pool.get_socket() as (reader, writer):
-            if isinstance(structure, str):
-                structure = struct.Struct(structure)
+        data = None
 
+        if isinstance(structure, construct.Struct):
+            data = structure.build(*value)
+        elif isinstance(structure, struct.Struct):
             data = structure.pack(*value)
+        elif isinstance(structure, str):
+            data = struct.pack(structure, *value)
+
+        async with self.pool.get_socket() as (reader, writer):
             return await self.write_memory(pid, address, data, reader=reader, writer=writer)
 
     async def write_text(self, pid: int, address: int, value: str, encoding: str = 'ascii') -> ResponseCode:
@@ -758,6 +1026,60 @@ class PS4Debug(object):
             value = value.encode(encoding)
 
             return await self.write_memory(pid, address, value, reader=reader, writer=writer)
+
+    async def get_kernel_base(self) -> int | None:
+        """
+        Retrieves the base address of the kernel.
+        @return: Base address of the kernel if successful, None otherwise
+        """
+        async with self.pool.get_socket() as (reader, writer):
+            status = await self.send_command(commands.KERN_BASE, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return
+
+            return construct.Int64ul.parse(await self.__recv_all(8, reader=reader))
+
+    async def read_kernel_memory(self, address: int, length: int) -> bytearray | None:
+        """
+        Read kernel memory.
+        @param address: Address to read from
+        @param length: Length in bytes
+        @return: Bytes if successful, otherwise None
+        """
+        async with self.pool.get_socket() as (reader, writer):
+            data = core.KernelMemoryPayload.build({
+                'address': address,
+                'length': length,
+            })
+            status = await self.send_command(commands.KERN_READ, data, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return
+
+            return await self.__recv_all(length, reader=reader)
+
+    async def write_kernel_memory(self, address: int, value: bytearray | bytes) -> ResponseCode:
+        """
+        Write to kernel memory. Be cautious when using this!
+        @param address: Starting address.
+        @param value: Bytes to write.
+        @return: Response code
+        """
+        async with self.pool.get_socket() as (reader, writer):
+            data = core.KernelMemoryPayload.build({
+                'address': address,
+                'length': len(value),
+            })
+            status = await self.send_command(commands.KERN_WRITE, data, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return status
+
+            writer.write(value)
+            await writer.drain()
+
+            return await self.get_status(reader=reader)
 
     # Wrappers
     read_bool: Callable[[int, int], bool] = functools.partialmethod(__read_type, structure='<?')
@@ -787,37 +1109,12 @@ class PS4Debug(object):
     write_double: Callable[[int, int, float], ResponseCode] = functools.partialmethod(__write_type, structure='<d')
 
     # Unfinished
-    def scan_int32(self, pid: int, compare_type: core.ScanCompareType, *values) -> list[int]:
-        bytes_value1 = struct.pack('<i', values[0]) if len(values) > 0 else b''
-        bytes_value2 = struct.pack('<i', values[1]) if len(values) > 1 else b''
-        length_value1 = len(bytes_value1)
-        length_value2 = len(bytes_value2)
+    async def __scan_int32(self, pid: int, compare_type: core.ScanCompareType, *values) -> list[int]:
+        return await self.__scan(pid, compare_type, core.ScanValueType.Int32, *values)
 
-        old_timeout = self.sock.gettimeout()
-        self.sock.settimeout(None)
-
-        payload = struct.pack('<ibbI', pid, 0, compare_type.value, length_value1 + length_value2)
-        status = self.send_command(commands.PROC_SCAN, payload)
-
-        if status != ResponseCode.SUCCESS:
-            return []
-
-        self.sock.sendall(bytes_value1 + bytes_value2)
-        status = self.get_status()
-
-        if status != ResponseCode.SUCCESS:
-            return []
-
-        addresses = []
-        address = self.__recv_int64()
-        while address != 0xFFFFFFFFFFFFFFFF:
-            addresses.append(address)
-            address = self.__recv_int64()
-
-        self.sock.settimeout(old_timeout)
-        return addresses
-
-    def scan(self, pid: int, compare_type: core.ScanCompareType, value_type: core.ScanValueType, *values) -> list[int]:
+    async def __scan(self, pid: int,
+                     compare_type: core.ScanCompareType,
+                     value_type: core.ScanValueType, *values) -> list[int]:
         """
         Scans the memory remotely for certain addresses
         @param pid: Process id
@@ -826,155 +1123,5 @@ class PS4Debug(object):
         @param values: Values depend on the compare type
         @return: List of addresses that fulfill the compare condition
         """
-        pass
-
-    async def get_thread_info(self, thread_id: int) -> object:
-        """
-
-        @param thread_id:
-        @return:
-        """
-        entry_size = 40
-        id_bytes = int.to_bytes(4, thread_id, 'little')
-
-        await self.send_command(commands.DEBUG_THRINFO, id_bytes)
-        data = await self.__recv_all(entry_size)
-        # pid, priority, name = ... struct in __init__
-        # use name[:name.index(0)].decode('ascii')
-
-        pid = int.from_bytes(data[:4], 'little')
-        priority = int.from_bytes(data[4:8], 'little')
-        print(data)
-        # name = data[8:8+data.index(0, 8)].decode('ascii')
-
-        return core.ThreadInfo(pid=pid, priority=priority, name='')
-
-    def breakpoint(self, index: int, enabled: bool, address: int) -> ResponseCode:
-        """
-
-        @param index:
-        @param enabled:
-        @param address:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def watchpoint(self, index: int, enabled: bool, address: int, length: object, type_: object) -> ResponseCode:
-        """
-
-        @param index:
-        @param enabled:
-        @param address:
-        @param length:
-        @param type_:
-        @return:
-        """
-        # length and type_ have to be new enums
-        raise NotImplementedError()
-
-    def get_debug_registers(self, lwpid: int) -> object:
-        """
-
-        @param lwpid:
-        @return:
-        """
-        # Registers have to be implemented as a class
-        raise NotImplementedError()
-
-    def set_debug_registers(self, lwpid: int, registers: object) -> ResponseCode:
-        """
-
-        @param lwpid:
-        @param registers:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def get_float_registers(self, lwpid: int) -> object:
-        """
-
-        @param lwpid:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def set_float_registers(self, lwpid: int, registers: object) -> ResponseCode:
-        """
-
-        @param lwpid:
-        @param registers:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def get_registers(self, lwpid: int) -> object:
-        """
-
-        @param lwpid:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def set_registers(self, lwpid: int, registers: object) -> ResponseCode:
-        """
-
-        @param lwpid:
-        @param registers:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def get_kernel_base(self) -> int:
-        """
-
-        @return:
-        """
-        raise NotImplementedError()
-
-    def read_kernel_memory(self, address: int, length: int) -> bytearray:
-        """
-
-        @param address:
-        @param length:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def write_kernel_memory(self, address: int, data: bytearray | bytes) -> ResponseCode:
-        """
-
-        @param address:
-        @param data:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def kill_process(self) -> ResponseCode:
-        """
-
-        @return:
-        """
-        raise NotImplementedError()
-
-    def resume_thread(self, lwpid: int) -> ResponseCode:
-        """
-
-        @param lwpid:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def stop_thread(self, lwpid: int) -> ResponseCode:
-        """
-
-        @param lwpid:
-        @return:
-        """
-        raise NotImplementedError()
-
-    def single_step(self) -> ResponseCode:
-        """
-
-        @return:
-        """
+        # TODO implement
         raise NotImplementedError()
