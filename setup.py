@@ -1,12 +1,17 @@
 from setuptools import setup, find_packages
 
 
+with open('README.md', 'r', encoding='utf-8') as fh:
+    long_description = fh.read()
+
 setup(
     name='ps4debug',
-    version='0.0.1',
+    version='0.1.0',
     author='Jay',
-    author_email='Jay#4711',
-    description='Integrates into Future Tone on the PS4',
+    author_email='0jaybae0@gmail.com',
+    description='Asynchronous ps4debug implementation in python',
+    long_description=long_description,
+    long_description_content_type='text/markdown',
     url='https://github.com/Jay184/PyPS4debug',
     project_urls={
         'Bug Tracker': 'https://github.com/Jay184/PyPS4debug/issues',
@@ -22,7 +27,7 @@ setup(
     entry_points='''
     ''',
     install_requires=[
-
+        'construct',
     ],
     python_requires='>=3.10'
 )
