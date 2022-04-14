@@ -6,10 +6,10 @@ with open('README.md', 'r', encoding='utf-8') as fh:
 
 setup(
     name='ps4debug',
-    version='0.0.8',
+    version='0.1.0',
     author='Jay',
     author_email='0jaybae0@gmail.com',
-    description='Integrates into Future Tone on the PS4',
+    description='Asynchronous ps4debug implementation in python',
     long_description=long_description,
     long_description_content_type='text/markdown',
     url='https://github.com/Jay184/PyPS4debug',
