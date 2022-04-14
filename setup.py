@@ -27,7 +27,7 @@ setup(
     entry_points='''
     ''',
     install_requires=[
-
+        'construct',
     ],
     python_requires='>=3.10'
 )
