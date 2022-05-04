@@ -1,3 +1,4 @@
+from __future__ import annotations
 from .core import ResponseCode
 from .exceptions import PS4DebugException
 import ps4debug.core as core
@@ -821,7 +822,7 @@ class PS4Debug(object):
             parameter_format = kwargs.get('parameter_format', f'<{len(args)}Q')
             output_format = kwargs.get('output_format', '<Q')
             rpc_stub = kwargs.get('rpc_stub')
-            rpc_stub = rpc_stub or self.get_rpc(pid, reader=reader, writer=writer)
+            rpc_stub = rpc_stub or await self.get_rpc(pid, reader=reader, writer=writer)
 
             assert struct.calcsize(parameter_format) <= core.CallPayload.parameters.sizeof()
             assert struct.calcsize(output_format) <= core.CallResult.rax.sizeof()
@@ -915,17 +916,15 @@ class PS4Debug(object):
         @return: Your desired struct or None if the command failed.
             The return value will always be packed in a tuple regardless of length.
         """
-        data = await self.read_memory(pid, address, structure.size)
-
-        if data is None:
-            return
-
         if isinstance(structure, construct.Struct):
-            return structure.parse(data)
+            data = await self.read_memory(pid, address, structure.sizeof())
+            return structure.parse(data) if data is not None else None
         elif isinstance(structure, struct.Struct):
-            return structure.unpack(data)
+            data = await self.read_memory(pid, address, structure.size)
+            return structure.unpack(data) if data is not None else None
         elif isinstance(structure, str):
-            return struct.unpack(structure, data)
+            data = await self.read_memory(pid, address, struct.calcsize(structure))
+            return struct.unpack(structure, data) if data is not None else None
 
     async def read_text(self, pid: int, address: int, encoding: str = 'ascii', **kwargs) -> str | None:
         """
