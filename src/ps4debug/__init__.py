@@ -1008,20 +1008,23 @@ class PS4Debug(object):
         async with self.pool.get_socket() as (reader, writer):
             return await self.write_memory(pid, address, data, reader=reader, writer=writer)
 
-    async def write_text(self, pid: int, address: int, value: str, encoding: str = 'ascii') -> ResponseCode:
+    async def write_text(self, pid: int, address: int, value: str,
+                         encoding: str = 'ascii',
+                         null_terminated: bool = True) -> ResponseCode:
         """
         Writes a text to an address.
         @param pid: Process id.
         @param address: Starting address.
         @param value: String to write.
         @param encoding: Encoding to use.
+        @param null_terminated: Automatically append trailing null character.
         @return: Response code.
         """
         async with self.pool.get_socket() as (reader, writer):
             if value is None:
                 return ResponseCode.DATA_NULL
 
-            value += '' if value.endswith('\0') else '\0'
+            value += '' if value.endswith('\0') or not null_terminated else '\0'
             value = value.encode(encoding)
 
             return await self.write_memory(pid, address, value, reader=reader, writer=writer)
