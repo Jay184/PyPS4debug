@@ -479,7 +479,7 @@ class PS4Debug(object):
         await writer.wait_closed()
 
     @contextlib.asynccontextmanager
-    async def memory(self, pid, length) -> AllocatedMemoryContext:
+    async def memory(self, pid, length: int = 4096) -> AllocatedMemoryContext:
         """
         Context manager to manage allocated memory
         @param pid: Process id
@@ -688,7 +688,7 @@ class PS4Debug(object):
         maps = list(construct.Array(count, core.ProcessMap).parse(data))
         return maps
 
-    async def allocate_memory(self, pid: int, length: int) -> int | None:
+    async def allocate_memory(self, pid: int, length: int = 4096) -> int | None:
         """
         Allocates memory in the remote process.
         @param pid: Process id
@@ -705,7 +705,7 @@ class PS4Debug(object):
             address = construct.Int64ul.parse(await self.__recv_all(8, reader=reader))
         return address
 
-    async def free_memory(self, pid: int, address: int, length: int) -> ResponseCode:
+    async def free_memory(self, pid: int, address: int, length: int = 4096) -> ResponseCode:
         """
         Frees a previously allocated memory section in the remote process.
         @param pid: Process id
