@@ -508,7 +508,7 @@ class PS4Debug(object):
         status = await self.send_command(commands.DEBUG_ATTACH, pid_bytes)
 
         if status != ResponseCode.SUCCESS:
-            yield
+            return
 
         if resume:
             await context.resume_process()
@@ -523,6 +523,7 @@ class PS4Debug(object):
             async with self.debug_server:
                 self.debug_server.close()
                 await self.debug_server.wait_closed()
+                self.debug_server = None
 
     async def get_status(self, reader: asyncio.StreamReader | None = None) -> ResponseCode:
         """
