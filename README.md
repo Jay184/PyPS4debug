@@ -32,9 +32,8 @@ A full example can be found at the end of this section!
     ```python
     from ps4debug import PS4Debug
 
-    hostname = 'ip address or hostname'
-
     if PS4Debug.find_ps4() is None:
+        hostname = 'ip address or hostname'
         await PS4Debug.send_ps4debug(hostname, port=9020)
     ```
 
@@ -66,7 +65,7 @@ A full example can be found at the end of this section!
     processes = await ps4.get_processes()
 
     for p in processes:
-    print(p.name, p.pid)
+        print(p.name, p.pid)
 
     # You may search for a specific name and get its process id (pid):
     process_name = 'eboot.bin'
@@ -215,13 +214,13 @@ A full example can be found at the end of this section!
     `get_process_maps` is helpful for getting an overview of the memory layout and find the base address.
 
     ```python
-    maps_ = await ps4.get_process_maps(pid)
+    maps = await ps4.get_process_maps(pid)
 
     # Filter for 'executable'
-    maps_ = [m for m in maps_ if 'executable' in m.name]
-    maps_.sort(key=lambda m: m.start)
+    maps = [m for m in maps if 'executable' in m.name]
+    maps.sort(key=lambda m: m.start)
 
-    base_address = maps_[0].start if len(maps_) else None
+    base_address = maps[0].start if len(maps) else None
     ```
 
 1. Allocating Memory
@@ -434,7 +433,7 @@ A full example can be found at the end of this section!
 
 1. Using `functools` to make code cleaner
 
-    Sometimes always passing the same ps4debu object, the pid and the address gets quite tedious and unclean.<br />
+    Sometimes always passing the same ps4debug object, the pid and the address gets quite tedious and unclean.<br />
     You can wrap it in a function, like so:
 
     ```python
