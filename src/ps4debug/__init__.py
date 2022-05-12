@@ -1,15 +1,21 @@
 from __future__ import annotations
-from .core import ResponseCode
-from .exceptions import PS4DebugException
+from typing import Callable, Coroutine
+#from .core import ResponseCode
+#from .exceptions import PS4DebugException
 import ps4debug.core as core
 import ps4debug.commands as commands
-from typing import Callable, Coroutine
 import socket
 import struct
 import functools
 import asyncio
 import contextlib
 import construct
+
+
+import core
+import exceptions
+ResponseCode = core.ResponseCode
+PS4DebugException = exceptions.PS4DebugException
 
 
 class AllocatedMemoryContext(object):
@@ -1111,20 +1117,85 @@ class PS4Debug(object):
     write_float: Callable[[int, int, float], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<f')
     write_double: Callable[[int, int, float], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<d')
 
-    # Unfinished
-    async def __scan_int32(self, pid: int, compare_type: core.ScanCompareType, *values) -> list[int]:
-        return await self.__scan(pid, compare_type, core.ScanValueType.Int32, *values)
-
-    async def __scan(self, pid: int,
-                     compare_type: core.ScanCompareType,
-                     value_type: core.ScanValueType, *values) -> list[int]:
+    async def scan_uint8(self, pid: int, compare_type: core.ScanCompareType,
+                         value: int, value2: int | None = None) -> list[int]:
         """
-        Scans the memory remotely for certain addresses
+        Scans the memory remotely for certain addresses.
         @param pid: Process id
-        @param compare_type: Way to compare the values
-        @param value_type: Type of the values to compare
-        @param values: Values depend on the compare type
-        @return: List of addresses that fulfill the compare condition
+        @param compare_type: Method of comparing the values
+        @param value: Unsigned byte [0;255]
+        @param value2: Only required for certain compare types like BiggerThan.
+        @return: List of matching addresses
         """
-        # TODO implement
-        raise NotImplementedError()
+        scan_value_type = 0
+        value_type_size = 1
+        values_required = core.ScanCompareType.parameters(compare_type)
+
+        if values_required == 2 and value2 is None:
+            raise PS4DebugException('This compare type requires two values but only one was given.')
+
+        header_struct = struct.Struct('<i2Bi')
+        values_struct = struct.Struct('<' + 'B' * values_required)
+
+        header = header_struct.pack(pid, scan_value_type, compare_type.value, value_type_size * values_required)
+        values = values_struct.pack(*[value, value2][:values_required])
+
+        async with self.pool.get_socket() as (reader, writer):
+            status = await self.send_command(commands.PROC_SCAN, header, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return []
+
+            writer.write(values)
+            await writer.drain()
+            status = await self.get_status(reader=reader)
+
+            if status != ResponseCode.SUCCESS:
+                return []
+
+            addresses = []
+            end = 2 ** 64 - 1
+
+            reader: asyncio.StreamReader
+            address = int.from_bytes(await reader.readexactly(8), 'little')
+            print(address)
+
+            while address < end:
+                addresses.append(address)
+                print(address)
+                address = int.from_bytes(await reader.readexactly(8), 'little')
+                print(len(addresses))
+
+            return addresses
+
+    async def __scan_uint8(self, pid: int, search_value: int, start_address: int, stop_address: int,
+                             chunk_size: int = 4096) -> set[int]:
+        value_struct = struct.Struct('<b')
+
+        async def __scan(_start, _stop) -> set[int]:
+            async with self.pool.get_socket() as (reader, writer):
+                addresses = set()
+
+                for chunk_address in range(_start, _stop, chunk_size):
+                    chunk = await self.read_memory(pid, chunk_address, chunk_size, reader=reader, writer=writer)
+
+                    for i in range(len(chunk)):
+                        chunk_value = value_struct.unpack(chunk[i:i + value_struct.size])[0]
+                        chunk_value_address = chunk_address + i
+
+                        if chunk_value == search_value:
+                            addresses.add(chunk_value_address)
+                            all_addresses = (_stop - _start)
+                            found_addresses = (chunk_address - _start)
+                            print(found_addresses / all_addresses * 100)
+
+                return addresses
+
+        task_count = 5
+        task_stride = (stop_address - start_address) // task_count
+
+        parts = [(start_address + i * task_stride, start_address + (i + 1) * task_stride) for i in range(task_count)]
+        tasks = [asyncio.create_task(__scan(a, b)) for a, b in parts]
+
+        results = await asyncio.gather(*tasks)
+        return set().union(*results)
