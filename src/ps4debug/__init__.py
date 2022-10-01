@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Callable, Coroutine
-#from .core import ResponseCode
-#from .exceptions import PS4DebugException
+from .core import ResponseCode
+from .exceptions import PS4DebugException
 import ps4debug.core as core
 import ps4debug.commands as commands
 import socket
@@ -10,12 +10,6 @@ import functools
 import asyncio
 import contextlib
 import construct
-
-
-import core
-import exceptions
-ResponseCode = core.ResponseCode
-PS4DebugException = exceptions.PS4DebugException
 
 
 class AllocatedMemoryContext(object):
