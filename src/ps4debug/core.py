@@ -58,33 +58,29 @@ class ScanCompareType(enum.IntEnum):
     BiggerThan = 2
     SmallerThan = 3
     ValueBetween = 4
-    IncreasedValue = 5
-    IncreasedValueBy = 6
-    DecreasedValue = 7
-    DecreasedValueBy = 8
-    ChangedValue = 9
-    UnchangedValue = 10
+    # IncreasedValue = 5
+    # IncreasedValueBy = 6
+    # DecreasedValue = 7
+    # DecreasedValueBy = 8
+    # ChangedValue = 9
+    # UnchangedValue = 10
     UnknownInitialValue = 11
 
     @classmethod
     def to_byte(cls, compare_type):
         compare_type.value.to_bytes(1, 'little')
 
-
-class ScanValueType(enum.IntEnum):
-    """PS4Debug scanning types"""
-    UInt8 = 0
-    Int8 = 1
-    UInt16 = 2
-    Int16 = 3
-    UInt32 = 4
-    Int32 = 5
-    UInt64 = 6
-    Int64 = 7
-    Float = 8
-    Double = 9
-    ByteArray = 10
-    String = 11
+    @classmethod
+    def parameters(cls, compare_type):
+        return 1 if compare_type in {
+            cls.ExactValue,
+            cls.FuzzyValue,
+            # cls.IncreasedValue,
+            # cls.DecreasedValue,
+            # cls.ChangedValue,
+            # cls.UnchangedValue,
+            cls.UnknownInitialValue,
+        } else 2
 
 
 class WatchPointLengthType(enum.IntEnum):

@@ -1,8 +1,9 @@
+from __future__ import annotations
+from typing import Callable, Coroutine
 from .core import ResponseCode
 from .exceptions import PS4DebugException
 import ps4debug.core as core
 import ps4debug.commands as commands
-from typing import Callable
 import socket
 import struct
 import functools
@@ -478,7 +479,7 @@ class PS4Debug(object):
         await writer.wait_closed()
 
     @contextlib.asynccontextmanager
-    async def memory(self, pid, length) -> AllocatedMemoryContext:
+    async def memory(self, pid, length: int = 4096) -> AllocatedMemoryContext:
         """
         Context manager to manage allocated memory
         @param pid: Process id
@@ -507,7 +508,7 @@ class PS4Debug(object):
         status = await self.send_command(commands.DEBUG_ATTACH, pid_bytes)
 
         if status != ResponseCode.SUCCESS:
-            yield
+            return
 
         if resume:
             await context.resume_process()
@@ -522,6 +523,7 @@ class PS4Debug(object):
             async with self.debug_server:
                 self.debug_server.close()
                 await self.debug_server.wait_closed()
+                self.debug_server = None
 
     async def get_status(self, reader: asyncio.StreamReader | None = None) -> ResponseCode:
         """
@@ -687,7 +689,7 @@ class PS4Debug(object):
         maps = list(construct.Array(count, core.ProcessMap).parse(data))
         return maps
 
-    async def allocate_memory(self, pid: int, length: int) -> int | None:
+    async def allocate_memory(self, pid: int, length: int = 4096) -> int | None:
         """
         Allocates memory in the remote process.
         @param pid: Process id
@@ -704,7 +706,7 @@ class PS4Debug(object):
             address = construct.Int64ul.parse(await self.__recv_all(8, reader=reader))
         return address
 
-    async def free_memory(self, pid: int, address: int, length: int) -> ResponseCode:
+    async def free_memory(self, pid: int, address: int, length: int = 4096) -> ResponseCode:
         """
         Frees a previously allocated memory section in the remote process.
         @param pid: Process id
@@ -821,7 +823,7 @@ class PS4Debug(object):
             parameter_format = kwargs.get('parameter_format', f'<{len(args)}Q')
             output_format = kwargs.get('output_format', '<Q')
             rpc_stub = kwargs.get('rpc_stub')
-            rpc_stub = rpc_stub or self.get_rpc(pid, reader=reader, writer=writer)
+            rpc_stub = rpc_stub or await self.get_rpc(pid, reader=reader, writer=writer)
 
             assert struct.calcsize(parameter_format) <= core.CallPayload.parameters.sizeof()
             assert struct.calcsize(output_format) <= core.CallResult.rax.sizeof()
@@ -915,17 +917,15 @@ class PS4Debug(object):
         @return: Your desired struct or None if the command failed.
             The return value will always be packed in a tuple regardless of length.
         """
-        data = await self.read_memory(pid, address, structure.size)
-
-        if data is None:
-            return
-
         if isinstance(structure, construct.Struct):
-            return structure.parse(data)
+            data = await self.read_memory(pid, address, structure.sizeof())
+            return structure.parse(data) if data is not None else None
         elif isinstance(structure, struct.Struct):
-            return structure.unpack(data)
+            data = await self.read_memory(pid, address, structure.size)
+            return structure.unpack(data) if data is not None else None
         elif isinstance(structure, str):
-            return struct.unpack(structure, data)
+            data = await self.read_memory(pid, address, struct.calcsize(structure))
+            return struct.unpack(structure, data) if data is not None else None
 
     async def read_text(self, pid: int, address: int, encoding: str = 'ascii', **kwargs) -> str | None:
         """
@@ -1009,20 +1009,23 @@ class PS4Debug(object):
         async with self.pool.get_socket() as (reader, writer):
             return await self.write_memory(pid, address, data, reader=reader, writer=writer)
 
-    async def write_text(self, pid: int, address: int, value: str, encoding: str = 'ascii') -> ResponseCode:
+    async def write_text(self, pid: int, address: int, value: str,
+                         encoding: str = 'ascii',
+                         null_terminated: bool = True) -> ResponseCode:
         """
         Writes a text to an address.
         @param pid: Process id.
         @param address: Starting address.
         @param value: String to write.
         @param encoding: Encoding to use.
+        @param null_terminated: Automatically append trailing null character.
         @return: Response code.
         """
         async with self.pool.get_socket() as (reader, writer):
             if value is None:
                 return ResponseCode.DATA_NULL
 
-            value += '' if value.endswith('\0') else '\0'
+            value += '' if value.endswith('\0') or not null_terminated else '\0'
             value = value.encode(encoding)
 
             return await self.write_memory(pid, address, value, reader=reader, writer=writer)
@@ -1082,46 +1085,111 @@ class PS4Debug(object):
             return await self.get_status(reader=reader)
 
     # Wrappers
-    read_bool: Callable[[int, int], bool] = functools.partialmethod(__read_type, structure='<?')
-    read_char: Callable[[int, int], str] = functools.partialmethod(__read_type, structure='<c')
-    read_byte: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<b')
-    read_ubyte: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<B')
-    read_int16: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<h')
-    read_uint16: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<H')
-    read_int32: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<i')
-    read_uint32: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<I')
-    read_int64: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<q')
-    read_uint64: Callable[[int, int], int] = functools.partialmethod(__read_type, structure='<Q')
-    read_float: Callable[[int, int], float] = functools.partialmethod(__read_type, structure='<f')
-    read_double: Callable[[int, int], float] = functools.partialmethod(__read_type, structure='<d')
+    read_bool: Callable[[int, int], Coroutine[bool]] = functools.partialmethod(__read_type, structure='<?')
+    read_char: Callable[[int, int], Coroutine[str]] = functools.partialmethod(__read_type, structure='<c')
+    read_byte: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<b')
+    read_ubyte: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<B')
+    read_int16: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<h')
+    read_uint16: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<H')
+    read_int32: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<i')
+    read_uint32: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<I')
+    read_int64: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<q')
+    read_uint64: Callable[[int, int], Coroutine[int]] = functools.partialmethod(__read_type, structure='<Q')
+    read_float: Callable[[int, int], Coroutine[float]] = functools.partialmethod(__read_type, structure='<f')
+    read_double: Callable[[int, int], Coroutine[float]] = functools.partialmethod(__read_type, structure='<d')
 
-    write_bool: Callable[[int, int, bool], ResponseCode] = functools.partialmethod(__write_type, structure='<?')
-    write_char: Callable[[int, int, str], ResponseCode] = functools.partialmethod(__write_type, structure='<c')
-    write_byte: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<b')
-    write_ubyte: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<B')
-    write_int16: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<h')
-    write_uint16: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<H')
-    write_int32: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<i')
-    write_uint32: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<I')
-    write_int64: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<q')
-    write_uint64: Callable[[int, int, int], ResponseCode] = functools.partialmethod(__write_type, structure='<Q')
-    write_float: Callable[[int, int, float], ResponseCode] = functools.partialmethod(__write_type, structure='<f')
-    write_double: Callable[[int, int, float], ResponseCode] = functools.partialmethod(__write_type, structure='<d')
+    write_bool: Callable[[int, int, bool], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<?')
+    write_char: Callable[[int, int, str], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<c')
+    write_byte: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<b')
+    write_ubyte: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<B')
+    write_int16: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<h')
+    write_uint16: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<H')
+    write_int32: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<i')
+    write_uint32: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<I')
+    write_int64: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<q')
+    write_uint64: Callable[[int, int, int], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<Q')
+    write_float: Callable[[int, int, float], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<f')
+    write_double: Callable[[int, int, float], Coroutine[ResponseCode]] = functools.partialmethod(__write_type, structure='<d')
 
-    # Unfinished
-    async def __scan_int32(self, pid: int, compare_type: core.ScanCompareType, *values) -> list[int]:
-        return await self.__scan(pid, compare_type, core.ScanValueType.Int32, *values)
-
-    async def __scan(self, pid: int,
-                     compare_type: core.ScanCompareType,
-                     value_type: core.ScanValueType, *values) -> list[int]:
+    async def scan_uint8(self, pid: int, compare_type: core.ScanCompareType,
+                         value: int, value2: int | None = None) -> list[int]:
         """
-        Scans the memory remotely for certain addresses
+        Scans the memory remotely for certain addresses.
         @param pid: Process id
-        @param compare_type: Way to compare the values
-        @param value_type: Type of the values to compare
-        @param values: Values depend on the compare type
-        @return: List of addresses that fulfill the compare condition
+        @param compare_type: Method of comparing the values
+        @param value: Unsigned byte [0;255]
+        @param value2: Only required for certain compare types like BiggerThan.
+        @return: List of matching addresses
         """
-        # TODO implement
-        raise NotImplementedError()
+        scan_value_type = 0
+        value_type_size = 1
+        values_required = core.ScanCompareType.parameters(compare_type)
+
+        if values_required == 2 and value2 is None:
+            raise PS4DebugException('This compare type requires two values but only one was given.')
+
+        header_struct = struct.Struct('<i2Bi')
+        values_struct = struct.Struct('<' + 'B' * values_required)
+
+        header = header_struct.pack(pid, scan_value_type, compare_type.value, value_type_size * values_required)
+        values = values_struct.pack(*[value, value2][:values_required])
+
+        async with self.pool.get_socket() as (reader, writer):
+            status = await self.send_command(commands.PROC_SCAN, header, reader=reader, writer=writer)
+
+            if status != ResponseCode.SUCCESS:
+                return []
+
+            writer.write(values)
+            await writer.drain()
+            status = await self.get_status(reader=reader)
+
+            if status != ResponseCode.SUCCESS:
+                return []
+
+            addresses = []
+            end = 2 ** 64 - 1
+
+            reader: asyncio.StreamReader
+            address = int.from_bytes(await reader.readexactly(8), 'little')
+            print(address)
+
+            while address < end:
+                addresses.append(address)
+                print(address)
+                address = int.from_bytes(await reader.readexactly(8), 'little')
+                print(len(addresses))
+
+            return addresses
+
+    async def __scan_uint8(self, pid: int, search_value: int, start_address: int, stop_address: int,
+                             chunk_size: int = 4096) -> set[int]:
+        value_struct = struct.Struct('<b')
+
+        async def __scan(_start, _stop) -> set[int]:
+            async with self.pool.get_socket() as (reader, writer):
+                addresses = set()
+
+                for chunk_address in range(_start, _stop, chunk_size):
+                    chunk = await self.read_memory(pid, chunk_address, chunk_size, reader=reader, writer=writer)
+
+                    for i in range(len(chunk)):
+                        chunk_value = value_struct.unpack(chunk[i:i + value_struct.size])[0]
+                        chunk_value_address = chunk_address + i
+
+                        if chunk_value == search_value:
+                            addresses.add(chunk_value_address)
+                            all_addresses = (_stop - _start)
+                            found_addresses = (chunk_address - _start)
+                            print(found_addresses / all_addresses * 100)
+
+                return addresses
+
+        task_count = 5
+        task_stride = (stop_address - start_address) // task_count
+
+        parts = [(start_address + i * task_stride, start_address + (i + 1) * task_stride) for i in range(task_count)]
+        tasks = [asyncio.create_task(__scan(a, b)) for a, b in parts]
+
+        results = await asyncio.gather(*tasks)
+        return set().union(*results)
