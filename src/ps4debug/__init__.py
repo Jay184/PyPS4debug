@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Callable, Coroutine
-from .core import ResponseCode
+from .core import ResponseCode, BreakpointEvent
 from .exceptions import PS4DebugException
 import ps4debug.core as core
 import ps4debug.commands as commands
