@@ -370,7 +370,7 @@ A full example can be found at the end of this section!
 
         ```python
         ret1, ret2 = await memory.call(50, -100, parameter_format='<2i', output_format='<2i')
-        print(ret1, ret2) # Will correctly print '1 2'
+        print(ret1, ret2)  # Will correctly print '1 2'
         ```
 
         See the [Python docs](https://docs.python.org/3/library/struct.html#format-strings) for more information on format strings.
