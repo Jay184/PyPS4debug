@@ -398,7 +398,7 @@ A full example can be found at the end of this section!
         
 
     async with ps4.debugger(pid, resume=True) as debugger:
-        debugger.set_breakpoint(0, True, address, on_hit=callback)
+        await debugger.set_breakpoint(0, True, address, on_hit=callback)
     ```
 
 1. Using async features
