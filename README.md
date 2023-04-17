@@ -184,7 +184,7 @@ A full example can be found at the end of this section!
         For structures you can pass either a format string, a struct.Struct instance or use construct's Struct.<br />
         Here we are writing two floats. See the [Python docs](https://docs.python.org/3/library/struct.html#format-strings) for more information on format strings.
         ```python
-        status = await ps4.write_struct(pid, 0xCC001234, structure='<2f', 2.5, -1.0)
+        status = await ps4.write_struct(pid, 0xCC001234, '<2f', 2.5, -1.0)
         ```
 
     1. String
@@ -249,8 +249,9 @@ A full example can be found at the end of this section!
     async def allocate(id_: int = None, length: int = 4096) -> int:
         address = await ps4.allocate_memory(pid, length)
         if id_ in allocated:
-            await free_memory(id_)
+            await free(id_)
         allocated[id_] = (address, length)
+        return address
 
     async def free(id_: int):
         if id_ in allocated:
@@ -417,9 +418,9 @@ A full example can be found at the end of this section!
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         
         for task in done:
-            response_code = await t
+            response_code = await task
 
-            if t is tasks[0]:
+            if task is tasks[0]:
                 print('0x123456:', response_code)
             else:
                 print(response_code)
