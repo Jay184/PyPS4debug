@@ -236,7 +236,6 @@ A full example can be found at the end of this section!
     ...
 
     await ps4.free_memory(pid, address, length)
-
     ```
 
     You can easily wrap these methods to create a memory manager using closures.
