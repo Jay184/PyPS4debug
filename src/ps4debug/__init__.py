@@ -433,7 +433,7 @@ class PS4Debug(object):
         return await self.write_struct(pid, address, structure, value)
 
     @classmethod
-    def find_ps4(cls) -> str | None:
+    def find_ps4(cls, timeout: int | None = None) -> str | None:
         """
         Attempts to find the IP address of the PlayStation 4 system in the same network.
         @return: String or None
@@ -448,7 +448,7 @@ class PS4Debug(object):
         # for ip in all_ips:
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.settimeout(20.0)
+        sock.settimeout(timeout or 20.0)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         # sock.bind((ip, 0))
         sock.sendto(data, ('255.255.255.255', port))
