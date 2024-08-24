@@ -394,7 +394,7 @@ A full example can be found at the end of this section!
         thread_id = event.interrupt.lwpid
         registers = event.interrupt.regs
         registers.rax = 42
-        event.debugger.set_registers(thread_id, registers)
+        await event.debugger.set_registers(thread_id, registers)
         
 
     async with ps4.debugger(pid, resume=True) as debugger:
