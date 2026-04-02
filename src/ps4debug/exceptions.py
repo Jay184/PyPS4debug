@@ -1,3 +1,3 @@
 class PS4DebugException(Exception):
-    def __init__(self, message):
-        super(PS4DebugException, self).__init__(message)
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
