@@ -11,7 +11,7 @@ maintainers = [
 ]
 license = "0BSD"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "autoregistry>=1.2.1",
     "construct>=2.10.70",
